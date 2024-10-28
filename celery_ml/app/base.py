@@ -2,6 +2,8 @@ from typing import Optional
 import redis
 import json
 import functools
+from celery_ml.app.tasks import Task
+from celery_ml.exceptions import TaskProcessingError , TaskTimeoutError
 
 class CeleryML :
     """"""
@@ -67,19 +69,30 @@ class CeleryML :
             self.enqueue_task(task_name, payload)
         return wrapper
     
-    def process_task(self,task:dict) -> None :
-        task_name = task['task_name']
-        payload = task['payload']
-        args = payload.get("args",[])
-        kwargs = payload.get("kwargs",{})
-
-        task_function = getattr(self,task_name , None)
-        if task_function :
-            try :
-                print(f"Processing task: {task_name} with args: {args} and kwargs: {kwargs}")
-                task_function(*args,**kwargs)
-                print(f"Task {task_name} completed successfully.")
-            except Exception as e : 
-                print(f"Error processing task {task_name} : {e}")
-        else :
-            print(f"Task {task_name} not found.")
+    def process_task(self, task: Task) -> None:
+        """Processes a given task."""
+        if task.task_name in self.allowed_tasks:
+            task_function = getattr(self, task.task_name, None)
+            if task_function:
+                try:
+                    print(f"Processing task: {task.task_name} with args: {task.payload.get('args', [])} and kwargs: {task.payload.get('kwargs', {})}")
+                    result = task_function(*task.payload.get("args", []), **task.payload.get("kwargs", {}))
+                    task.result = result
+                    task.status = "completed"
+                    self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+                    print(f"Task {task.task_name} completed successfully with result: {result}")
+                except Exception as e:
+                    task.status = "failed"
+                    task.result = str(e)
+                    self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+                    raise TaskProcessingError(task.task_name, str(e))
+            else:
+                task.status = "failed"
+                task.result = "Task function not found"
+                self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+                raise TaskProcessingError(task.task_name, "Task function not found")
+        else:
+            task.status = "failed"
+            task.result = "Task not allowed"
+            self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+            raise TaskProcessingError(task.task_name, "Task not allowed")
