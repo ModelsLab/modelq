@@ -1,10 +1,7 @@
 from typing import Optional
-
 import redis
 import json
 import functools
-
-
 
 class CeleryML :
     """"""
@@ -48,5 +45,41 @@ class CeleryML :
             )
 
         return connection
+    
+    def enqueue_task(self,task_name : str , payload : dict) :
+        task = {
+            "task_name" : task_name,
+            "payload" : payload,
+            "status" : "queued"
+        }
 
-            
+        self.redis_client.rpush("ml_tasks",json.dumps(task))
+
+    def task(self,func) :
+        """Decorator to create tasks."""
+        @functools.wraps(func)
+        def wrapper(*args,**kwargs):
+            task_name = func.__name__
+            payload = {
+                "args" : args,
+                "kwargs" : kwargs
+            }
+            self.enqueue_task(task_name, payload)
+        return wrapper
+    
+    def process_task(self,task:dict) -> None :
+        task_name = task['task_name']
+        payload = task['payload']
+        args = payload.get("args",[])
+        kwargs = payload.get("kwargs",{})
+
+        task_function = getattr(self,task_name , None)
+        if task_function :
+            try :
+                print(f"Processing task: {task_name} with args: {args} and kwargs: {kwargs}")
+                task_function(*args,**kwargs)
+                print(f"Task {task_name} completed successfully.")
+            except Exception as e : 
+                print(f"Error processing task {task_name} : {e}")
+        else :
+            print(f"Task {task_name} not found.")

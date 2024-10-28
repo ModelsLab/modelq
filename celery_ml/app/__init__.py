@@ -1,5 +1,4 @@
-from app import CeleryML
-
+from base import CeleryML
 
 __all__ = [
     "CeleryML"
