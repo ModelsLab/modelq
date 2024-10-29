@@ -5,6 +5,7 @@ import functools
 from celery_ml.app.tasks import Task
 from celery_ml.exceptions import TaskProcessingError , TaskTimeoutError
 from celery_ml.app.cache import Cache
+import threading
 
 class CeleryML :
     """"""
@@ -54,8 +55,7 @@ class CeleryML :
     
     def enqueue_task(self,task_name : str , payload : dict) :
         task = {
-            "task_name" : task_name,
-            "payload" : payload,
+            **task_name,
             "status" : "queued"
         }
 
@@ -80,6 +80,24 @@ class CeleryML :
             return wrapper
         return decorator
     
+    def start_worker(self):
+        def worker_loop():
+            while True :
+                task_data = self.redis_client.blpop("ml_tasks")
+                if task_data :
+                    _, task_json = task_data
+                    task_dict = json.loads(task_json)
+                    print(task_dict)
+                    task = Task.from_dict(task_dict)
+                    print(task)
+                    try :
+                        self.process_task(task)
+                    except TaskProcessingError as e :
+                        print(f"Error processing task : {e}")
+        worker_thread = threading.Thread(target=worker_loop)
+        worker_thread.daemon = True
+        worker_thread.start()
+
     def process_task(self, task: Task) -> None:
         """Processes a given task."""
         if task.task_name in self.allowed_tasks:

@@ -29,7 +29,7 @@ class Task :
     
     @staticmethod
     def from_dict(data : dict ) -> 'Task' :
-        task = Task(task = data["task_name"],payload = data["payload"])
+        task = Task(task_name = data["task_name"],payload = data["payload"])
         task.task_id = data["task_id"]
         task.status = data["status"]
         task.result = data.get("result")
