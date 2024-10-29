@@ -1,9 +1,10 @@
-from typing import Optional
+from typing import Optional , Dict , Any
 import redis
 import json
 import functools
 from celery_ml.app.tasks import Task
 from celery_ml.exceptions import TaskProcessingError , TaskTimeoutError
+from celery_ml.app.cache import Cache
 
 class CeleryML :
     """"""
@@ -25,10 +26,13 @@ class CeleryML :
             db = db,
             password= password,
             username = username,
-            ssh = ssl,
+            ssl = ssl,
             ssl_cert_reqs= ssl_cert_reqs,
             **kwargs
         )
+        self.allowed_tasks = set()
+        self.cache = Cache()
+        self.task_configurations: Dict[str, Dict[str, Any]] = {}
     
     def _connect_to_redis(
             self,host : str,port : str , db : int ,  password : str,ssl : bool , ssl_cert_reqs : any,username : str
@@ -57,17 +61,24 @@ class CeleryML :
 
         self.redis_client.rpush("ml_tasks",json.dumps(task))
 
-    def task(self,func) :
-        """Decorator to create tasks."""
-        @functools.wraps(func)
-        def wrapper(*args,**kwargs):
-            task_name = func.__name__
-            payload = {
-                "args" : args,
-                "kwargs" : kwargs
-            }
-            self.enqueue_task(task_name, payload)
-        return wrapper
+    def task(self, task_class=Task):
+        """Decorator to create a task. Allows specifying a custom task class."""
+        def decorator(func):
+            @functools.wraps(func)
+            def wrapper(*args, **kwargs):
+                task_name = func.__name__
+                payload = {
+                    "args": args,
+                    "kwargs": kwargs
+                }
+                task = task_class(task_name=task_name, payload=payload)
+                self.enqueue_task(task.to_dict(),payload=payload)
+                return task.get_result(self.redis_client)
+            # Attach the function to the instance so it can be called by process_task
+            setattr(self, func.__name__, func)
+            self.allowed_tasks.add(func.__name__)
+            return wrapper
+        return decorator
     
     def process_task(self, task: Task) -> None:
         """Processes a given task."""

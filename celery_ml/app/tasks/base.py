@@ -5,6 +5,7 @@ import redis
 from typing import Any , Optional
 from celery_ml.exceptions import TaskTimeoutError
 
+
 class Task :
 
     def __init__(self,task_name : str , payload : dict,timeout : int = 15):
