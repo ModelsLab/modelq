@@ -1,4 +1,5 @@
 from celery_ml import CeleryML
+import time
 
 celery_ml = CeleryML()
 print(celery_ml)
@@ -6,6 +7,7 @@ print(celery_ml)
 
 @celery_ml.task()
 def add(a, b):
+    # time.sleep(20)
     return a + b
 
 celery_ml.start_worker()

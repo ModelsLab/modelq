@@ -5,6 +5,7 @@ import functools
 from celery_ml.app.tasks import Task
 from celery_ml.exceptions import TaskProcessingError , TaskTimeoutError
 from celery_ml.app.cache import Cache
+from celery_ml.app.middleware import Middleware
 import threading
 
 class CeleryML :
@@ -34,6 +35,7 @@ class CeleryML :
         self.allowed_tasks = set()
         self.cache = Cache()
         self.task_configurations: Dict[str, Dict[str, Any]] = {}
+        self.middleware : Middleware = None
     
     def _connect_to_redis(
             self,host : str,port : str , db : int ,  password : str,ssl : bool , ssl_cert_reqs : any,username : str
@@ -81,6 +83,7 @@ class CeleryML :
         return decorator
     
     def start_worker(self):
+        self.check_middleware("before_worker_boot")
         def worker_loop():
             while True :
                 task_data = self.redis_client.blpop("ml_tasks")
@@ -97,6 +100,11 @@ class CeleryML :
         worker_thread = threading.Thread(target=worker_loop)
         worker_thread.daemon = True
         worker_thread.start()
+
+
+    def check_middleware(self,middleware_event : str):
+        if self.middleware :
+            self.middleware.execute(middleware_event)
 
     def process_task(self, task: Task) -> None:
         """Processes a given task."""
