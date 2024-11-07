@@ -1,49 +1,49 @@
-from typing import Optional , Dict , Any
+from typing import Optional, Dict, Any
 import redis
 import json
 import functools
+import threading
+import time
 from celery_ml.app.tasks import Task
-from celery_ml.exceptions import TaskProcessingError , TaskTimeoutError
+from celery_ml.exceptions import TaskProcessingError, TaskTimeoutError
 from celery_ml.app.cache import Cache
 from celery_ml.app.middleware import Middleware
-import threading
 
-class CeleryML :
+class CeleryML:
     """"""
 
     def __init__(
             self,
-            host : str = "localhost",
-            username : str = None,
-            port : str = 6379,
-            db : int = 0  ,
-            password : str = None,
-            ssl : bool = False,
-            ssl_cert_reqs : any = None,
+            host: str = "localhost",
+            username: str = None,
+            port: str = 6379,
+            db: int = 0,
+            password: str = None,
+            ssl: bool = False,
+            ssl_cert_reqs: any = None,
             **kwargs
-                 ):
+    ):
         self.redis_client = self._connect_to_redis(
             host=host,
-            port = port,
-            db = db,
-            password= password,
-            username = username,
-            ssl = ssl,
-            ssl_cert_reqs= ssl_cert_reqs,
+            port=port,
+            db=db,
+            password=password,
+            username=username,
+            ssl=ssl,
+            ssl_cert_reqs=ssl_cert_reqs,
             **kwargs
         )
         self.allowed_tasks = set()
         self.cache = Cache()
         self.task_configurations: Dict[str, Dict[str, Any]] = {}
-        self.middleware : Middleware = None
-    
+        self.middleware: Middleware = None
+
     def _connect_to_redis(
-            self,host : str,port : str , db : int ,  password : str,ssl : bool , ssl_cert_reqs : any,username : str
+            self, host: str, port: str, db: int, password: str, ssl: bool, ssl_cert_reqs: any, username: str
     ) -> redis.Redis:
         if host == "localhost":
-            connection = redis.Redis(host = "localhost",db = 3) 
-
-        else :
+            connection = redis.Redis(host="localhost", db=3)
+        else:
             connection = redis.Redis(
                 host=host,
                 port=port,
@@ -54,56 +54,56 @@ class CeleryML :
             )
 
         return connection
-    
-    def enqueue_task(self,task_name : str , payload : dict) :
+
+    def enqueue_task(self, task_name: str, payload: dict):
         task = {
             **task_name,
-            "status" : "queued"
+            "status": "queued"
         }
 
-        self.redis_client.rpush("ml_tasks",json.dumps(task))
+        self.redis_client.rpush("ml_tasks", json.dumps(task))
 
-    def task(self, task_class=Task):
-        """Decorator to create a task. Allows specifying a custom task class."""
+    def task(self, task_class=Task, timeout: Optional[int] = None):
+        """Decorator to create a task. Allows specifying a custom task class and timeout."""
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
                 task_name = func.__name__
                 payload = {
                     "args": args,
-                    "kwargs": kwargs
+                    "kwargs": kwargs,
+                    "timeout": timeout
                 }
                 task = task_class(task_name=task_name, payload=payload)
-                self.enqueue_task(task.to_dict(),payload=payload)
+                self.enqueue_task(task.to_dict(), payload=payload)
                 return task.get_result(self.redis_client)
             # Attach the function to the instance so it can be called by process_task
             setattr(self, func.__name__, func)
             self.allowed_tasks.add(func.__name__)
             return wrapper
         return decorator
-    
+
     def start_worker(self):
         self.check_middleware("before_worker_boot")
         def worker_loop():
-            while True :
+            while True:
                 task_data = self.redis_client.blpop("ml_tasks")
-                if task_data :
+                if task_data:
                     _, task_json = task_data
                     task_dict = json.loads(task_json)
                     print(task_dict)
                     task = Task.from_dict(task_dict)
                     print(task)
-                    try :
+                    try:
                         self.process_task(task)
-                    except TaskProcessingError as e :
-                        print(f"Error processing task : {e}")
+                    except TaskProcessingError as e:
+                        print(f"Error processing task: {e}")
         worker_thread = threading.Thread(target=worker_loop)
         worker_thread.daemon = True
         worker_thread.start()
 
-
-    def check_middleware(self,middleware_event : str):
-        if self.middleware :
+    def check_middleware(self, middleware_event: str):
+        if self.middleware:
             self.middleware.execute(middleware_event)
 
     def process_task(self, task: Task) -> None:
@@ -113,7 +113,11 @@ class CeleryML :
             if task_function:
                 try:
                     print(f"Processing task: {task.task_name} with args: {task.payload.get('args', [])} and kwargs: {task.payload.get('kwargs', {})}")
-                    result = task_function(*task.payload.get("args", []), **task.payload.get("kwargs", {}))
+                    timeout = task.payload.get("timeout", None)
+                    if timeout:
+                        result = self._run_with_timeout(task_function, timeout, *task.payload.get("args", []), **task.payload.get("kwargs", {}))
+                    else:
+                        result = task_function(*task.payload.get("args", []), **task.payload.get("kwargs", {}))
                     task.result = result
                     task.status = "completed"
                     self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
@@ -133,3 +137,23 @@ class CeleryML :
             task.result = "Task not allowed"
             self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
             raise TaskProcessingError(task.task_name, "Task not allowed")
+
+    def _run_with_timeout(self, func, timeout, *args, **kwargs):
+        """Runs a function with a timeout."""
+        result = [None]
+        exception = [None]
+
+        def target():
+            try:
+                result[0] = func(*args, **kwargs)
+            except Exception as e:
+                exception[0] = e
+
+        thread = threading.Thread(target=target)
+        thread.start()
+        thread.join(timeout)
+        if thread.is_alive():
+            raise TaskTimeoutError(f"Task exceeded timeout of {timeout} seconds")
+        if exception[0]:
+            raise exception[0]
+        return result[0]
