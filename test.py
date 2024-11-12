@@ -20,26 +20,20 @@ from celery_ml import CeleryML
 import time
 from celery_ml.exceptions import TaskTimeoutError
 
-# Create an instance of CeleryML
 celery_ml = CeleryML()
 
-# Print the CeleryML instance to verify its creation
 print(celery_ml)
 
-# Define a task using CeleryML's task decorator with a timeout of 5 seconds
 @celery_ml.task(timeout=15)
-def add(a, b):
-    # Simulate a long-running task by sleeping for 10 seconds
+def add(a, b,c):
     time.sleep(10)
-    return a + b
+    return a + b + c
 
-# Start the worker in a separate thread
 celery_ml.start_worker()
 
 try:
-    # Enqueue the task with arguments, the task should time out
-    result_add = add(3, 4)
-    print(f"Result of add(3, 4): {result_add}")
+    result_add = add(3, 4,5)
+    print(f"Result of add(3, 4,5): {result_add}")
 except TaskTimeoutError as e:
     print(f"Task timed out: {e}")
 except Exception as e:
