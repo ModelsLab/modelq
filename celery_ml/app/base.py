@@ -4,6 +4,7 @@ import json
 import functools
 import threading
 import time
+import sqlite3
 from celery_ml.app.tasks import Task
 from celery_ml.exceptions import TaskProcessingError, TaskTimeoutError
 from celery_ml.app.cache import Cache
@@ -21,6 +22,7 @@ class CeleryML:
             password: str = None,
             ssl: bool = False,
             ssl_cert_reqs: any = None,
+            cache_db_path: str = "cache.db",
             **kwargs
     ):
         self.redis_client = self._connect_to_redis(
@@ -34,7 +36,8 @@ class CeleryML:
             **kwargs
         )
         self.allowed_tasks = set()
-        self.cache = Cache()
+        self.cache_db_path = cache_db_path
+        self.cache = Cache(db_path=cache_db_path)
         self.task_configurations: Dict[str, Dict[str, Any]] = {}
         self.middleware: Middleware = None
 
@@ -79,6 +82,8 @@ class CeleryML:
                 if stream:
                     task.stream = True
                 self.enqueue_task(task.to_dict(), payload=payload)
+                # Store task in cache
+                task.store_in_cache(self.cache_db_path)
                 return task
             # Attach the function to the instance so it can be called by process_task
             setattr(self, func.__name__, func)
@@ -133,21 +138,29 @@ class CeleryML:
                         task.result = result
                         task.status = "completed"
                         self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+                    # Store updated task status in cache
+                    task.store_in_cache(self.cache_db_path)
                     print(f"Task {task.task_name} completed successfully")
                 except Exception as e:
                     task.status = "failed"
                     task.result = str(e)
                     self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+                    # Store failed task status in cache
+                    task.store_in_cache(self.cache_db_path)
                     raise TaskProcessingError(task.task_name, str(e))
             else:
                 task.status = "failed"
                 task.result = "Task function not found"
                 self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+                # Store failed task status in cache
+                task.store_in_cache(self.cache_db_path)
                 raise TaskProcessingError(task.task_name, "Task function not found")
         else:
             task.status = "failed"
             task.result = "Task not allowed"
             self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+            # Store failed task status in cache
+            task.store_in_cache(self.cache_db_path)
             raise TaskProcessingError(task.task_name, "Task not allowed")
 
     def _run_with_timeout(self, func, timeout, *args, **kwargs):
@@ -169,3 +182,21 @@ class CeleryML:
         if exception[0]:
             raise exception[0]
         return result[0]
+
+    def get_all_queued_tasks(self) -> list:
+        """Retrieves all tasks with status 'queued' from the SQLite cache database."""
+        with sqlite3.connect(self.cache_db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT task_id, task_name, status FROM tasks WHERE status = ?', ("queued",))
+            rows = cursor.fetchall()
+            return [{"task_id": row[0], "task_name": row[1], "status": row[2]} for row in rows]
+
+    def get_task_status(self, task_id: str) -> Optional[str]:
+        """Retrieves the status of a particular task by task ID from the SQLite cache database."""
+        with sqlite3.connect(self.cache_db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute('SELECT status FROM tasks WHERE task_id = ?', (task_id,))
+            row = cursor.fetchone()
+            if row:
+                return row[0]
+            return None

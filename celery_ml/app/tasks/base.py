@@ -2,6 +2,7 @@ import uuid
 import time
 import json
 import redis
+import sqlite3
 from typing import Any , Optional, Generator
 from celery_ml.exceptions import TaskTimeoutError
 
@@ -17,6 +18,7 @@ class Task :
         self.timestamp = time.time()
         self.timeout = timeout
         self.stream = False
+        self.combined_result = ""
 
     def to_dict(self) :
         return {
@@ -39,6 +41,18 @@ class Task :
         task.stream = data.get("stream", False)
         return task
     
+    def store_in_cache(self, db_path: str = "cache.db") -> None:
+        """Stores the task in the SQLite cache database."""
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                '''
+                INSERT OR REPLACE INTO tasks (task_id, task_name, payload, status, result, timestamp)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ''',
+                (self.task_id, self.task_name, json.dumps(self.payload), self.status, self.result, self.timestamp)
+            )
+            conn.commit()
 
     def get_result(self, redis_client: redis.Redis, timeout: int = None) -> Any:
         """Waits for the result of the task until the timeout."""
@@ -53,6 +67,8 @@ class Task :
                 task_data = json.loads(task_json)
                 self.result = task_data.get("result")
                 self.status = task_data.get("status")
+                # Store the updated task status in cache
+                self.store_in_cache()
                 return self.result
             time.sleep(1)
         raise TaskTimeoutError(self.task_id)
@@ -68,12 +84,19 @@ class Task :
             if results:
                 for _, messages in results:
                     for message_id, message_data in messages:
-                        yield json.loads(message_data[b"result"].decode("utf-8"))
+                        result = json.loads(message_data[b"result"].decode("utf-8"))
+                        yield result
                         last_id = message_id
+                        # Concatenate result for storing combined response
+                        self.combined_result += result
             # Check if the task is marked as completed after yielding current messages
             task_json = redis_client.get(f"task_result:{self.task_id}")
             if task_json:
                 task_data = json.loads(task_json)
                 if task_data.get("status") == "completed":
                     completed = True
+                    # Store the completed task status and combined result in cache
+                    self.status = "completed"
+                    self.result = self.combined_result
+                    self.store_in_cache()
         return
