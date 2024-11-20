@@ -2,7 +2,7 @@ import uuid
 import time
 import json
 import redis
-from typing import Any , Optional
+from typing import Any , Optional, Generator
 from celery_ml.exceptions import TaskTimeoutError
 
 
@@ -16,6 +16,7 @@ class Task :
         self.result = None 
         self.timestamp = time.time()
         self.timeout = timeout
+        self.stream = False
 
     def to_dict(self) :
         return {
@@ -24,7 +25,8 @@ class Task :
             "payload" : self.payload,
             "status" : self.status,
             "result" : self.result,
-            "timestamp" : self.timestamp
+            "timestamp" : self.timestamp,
+            "stream": self.stream
         }
     
     @staticmethod
@@ -34,6 +36,7 @@ class Task :
         task.status = data["status"]
         task.result = data.get("result")
         task.timestamp = data["timestamp"]
+        task.stream = data.get("stream", False)
         return task
     
 
@@ -53,3 +56,24 @@ class Task :
                 return self.result
             time.sleep(1)
         raise TaskTimeoutError(self.task_id)
+
+    def get_stream(self, redis_client: redis.Redis) -> Generator[Any, None, None]:
+        """Generator to yield results from a streaming task."""
+        stream_key = f"task_stream:{self.task_id}"
+        last_id = "0"
+        completed = False
+
+        while not completed:
+            results = redis_client.xread({stream_key: last_id}, block=1000, count=10)
+            if results:
+                for _, messages in results:
+                    for message_id, message_data in messages:
+                        yield json.loads(message_data[b"result"].decode("utf-8"))
+                        last_id = message_id
+            # Check if the task is marked as completed after yielding current messages
+            task_json = redis_client.get(f"task_result:{self.task_id}")
+            if task_json:
+                task_data = json.loads(task_json)
+                if task_data.get("status") == "completed":
+                    completed = True
+        return

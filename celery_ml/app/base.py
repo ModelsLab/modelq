@@ -1,4 +1,4 @@
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, Generator
 import redis
 import json
 import functools
@@ -10,7 +10,7 @@ from celery_ml.app.cache import Cache
 from celery_ml.app.middleware import Middleware
 
 class CeleryML:
-    """"""
+    """CeleryML class for managing machine learning tasks with Redis queueing and streaming."""
 
     def __init__(
             self,
@@ -63,8 +63,8 @@ class CeleryML:
 
         self.redis_client.rpush("ml_tasks", json.dumps(task))
 
-    def task(self, task_class=Task, timeout: Optional[int] = None):
-        """Decorator to create a task. Allows specifying a custom task class and timeout."""
+    def task(self, task_class=Task, timeout: Optional[int] = None, stream: bool = False):
+        """Decorator to create a task. Allows specifying a custom task class, timeout, and streaming support."""
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
@@ -72,11 +72,14 @@ class CeleryML:
                 payload = {
                     "args": args,
                     "kwargs": kwargs,
-                    "timeout": timeout
+                    "timeout": timeout,
+                    "stream": stream
                 }
                 task = task_class(task_name=task_name, payload=payload)
+                if stream:
+                    task.stream = True
                 self.enqueue_task(task.to_dict(), payload=payload)
-                return task.get_result(self.redis_client)
+                return task
             # Attach the function to the instance so it can be called by process_task
             setattr(self, func.__name__, func)
             self.allowed_tasks.add(func.__name__)
@@ -103,8 +106,9 @@ class CeleryML:
         worker_thread.start()
 
     def check_middleware(self, middleware_event: str):
+        print(f"got {middleware_event}")
         if self.middleware:
-            self.middleware.execute(middleware_event)
+            self.middleware.execute(event=middleware_event)
 
     def process_task(self, task: Task) -> None:
         """Processes a given task."""
@@ -114,14 +118,22 @@ class CeleryML:
                 try:
                     print(f"Processing task: {task.task_name} with args: {task.payload.get('args', [])} and kwargs: {task.payload.get('kwargs', {})}")
                     timeout = task.payload.get("timeout", None)
-                    if timeout:
-                        result = self._run_with_timeout(task_function, timeout, *task.payload.get("args", []), **task.payload.get("kwargs", {}))
+                    if task.payload.get("stream", False):
+                        for result in task_function(*task.payload.get("args", []), **task.payload.get("kwargs", {})):
+                            task.status = "in_progress"
+                            self.redis_client.xadd(f"task_stream:{task.task_id}", {"result": json.dumps(result)})
+                        # Mark the task as completed when streaming ends
+                        task.status = "completed"
+                        self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
                     else:
-                        result = task_function(*task.payload.get("args", []), **task.payload.get("kwargs", {}))
-                    task.result = result
-                    task.status = "completed"
-                    self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
-                    print(f"Task {task.task_name} completed successfully with result: {result}")
+                        if timeout:
+                            result = self._run_with_timeout(task_function, timeout, *task.payload.get("args", []), **task.payload.get("kwargs", {}))
+                        else:
+                            result = task_function(*task.payload.get("args", []), **task.payload.get("kwargs", {}))
+                        task.result = result
+                        task.status = "completed"
+                        self.redis_client.set(f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600)
+                    print(f"Task {task.task_name} completed successfully")
                 except Exception as e:
                     task.status = "failed"
                     task.result = str(e)
