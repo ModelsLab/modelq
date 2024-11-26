@@ -5,13 +5,13 @@ import functools
 import threading
 import time
 import sqlite3
-from celery_ml.app.tasks import Task
-from celery_ml.exceptions import TaskProcessingError, TaskTimeoutError
-from celery_ml.app.cache import Cache
-from celery_ml.app.middleware import Middleware
+from modelq.app.tasks import Task
+from modelq.exceptions import TaskProcessingError, TaskTimeoutError
+from modelq.app.cache import Cache
+from modelq.app.middleware import Middleware
 
-class CeleryML:
-    """CeleryML class for managing machine learning tasks with Redis queueing and streaming."""
+class ModelQ:
+    """ModelQ class for managing machine learning tasks with Redis queueing and streaming."""
 
     def __init__(
             self,

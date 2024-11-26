@@ -1,19 +1,19 @@
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from threading import Thread
-from celery_ml import CeleryML
-from celery_ml.app.middleware import Middleware
+from modelq import ModelQ
+from modelq.app.middleware import Middleware
 
 
-celery_ml = CeleryML()
+modelq = ModelQ()
 
 class BeforeWorker(Middleware):
     def before_worker_boot(self):
         tok = AutoTokenizer.from_pretrained("openai-community/gpt2")
         model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
 
-celery_ml.middleware = BeforeWorker()
+modelq.middleware = BeforeWorker()
 
-@celery_ml.task(timeout=15, stream=True)
+@modelq.task(timeout=15, stream=True)
 def stream(params):
     tok = AutoTokenizer.from_pretrained("openai-community/gpt2")
     model = AutoModelForCausalLM.from_pretrained("openai-community/gpt2")
@@ -27,10 +27,10 @@ def stream(params):
     for new_text in streamer:
         yield new_text
 
-@celery_ml.task(timeout=15)
+@modelq.task(timeout=15)
 def add_task():
     return 2 + 3
 
-celery_ml.start_worker()
+modelq.start_worker()
 
 

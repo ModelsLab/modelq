@@ -4,7 +4,7 @@ import sys
 import click
 import json
 
-from celery_ml.app.tasks import Task
+from modelq.app.tasks import Task
 from typing import Optional
 
 class Cache :

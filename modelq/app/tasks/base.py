@@ -4,7 +4,7 @@ import json
 import redis
 import sqlite3
 from typing import Any , Optional, Generator
-from celery_ml.exceptions import TaskTimeoutError
+from modelq.exceptions import TaskTimeoutError
 
 
 class Task :
