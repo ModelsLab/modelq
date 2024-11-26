@@ -1,13 +1,17 @@
 [tool.poetry]
 name = "celery-ml"
 version = "0.1.0"
-description = ""
+description = "Celery-like task queue for ML inference."
 authors = ["Tanmaypatil123 <tanmay@modelslab.com>"]
 readme = "README.md"
 
+[tool.poetry.scripts]
+celery-ml = "celery_ml.app:run_worker"
+
 [tool.poetry.dependencies]
 python = "^3.10"
-
+click = "^8.0.0"
+redis = "^4.0.0"
 
 [build-system]
 requires = ["poetry-core"]

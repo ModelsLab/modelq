@@ -1,4 +1,4 @@
-from app import CeleryML
+from .app import CeleryML
 
 
 __all__ = [
