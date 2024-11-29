@@ -5,6 +5,7 @@ import functools
 import threading
 import time
 import sqlite3
+import uuid
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError
 from modelq.app.cache import Cache
@@ -16,6 +17,7 @@ class ModelQ:
     def __init__(
             self,
             host: str = "localhost",
+            server_id: Optional[str] = None,
             username: str = None,
             port: str = 6379,
             db: int = 0,
@@ -35,11 +37,14 @@ class ModelQ:
             ssl_cert_reqs=ssl_cert_reqs,
             **kwargs
         )
+        self.server_id = server_id or str(uuid.uuid4())
         self.allowed_tasks = set()
         self.cache_db_path = cache_db_path
         self.cache = Cache(db_path=cache_db_path)
         self.task_configurations: Dict[str, Dict[str, Any]] = {}
         self.middleware: Middleware = None
+        self.register_server()
+        self.worker_thread = None
 
     def _connect_to_redis(
             self, host: str, port: str, db: int, password: str, ssl: bool, ssl_cert_reqs: any, username: str
@@ -57,6 +62,16 @@ class ModelQ:
             )
 
         return connection
+
+    def register_server(self):
+        """Registers the server in Redis with its capabilities."""
+        self.redis_client.hset("servers", self.server_id, json.dumps({"allowed_tasks": list(self.allowed_tasks), "status": "idle"}))
+
+    def update_server_status(self, status: str):
+        """Updates the server status in Redis."""
+        server_data = json.loads(self.redis_client.hget("servers", self.server_id))
+        server_data["status"] = status
+        self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
 
     def enqueue_task(self, task_name: str, payload: dict):
         task = {
@@ -88,27 +103,41 @@ class ModelQ:
             # Attach the function to the instance so it can be called by process_task
             setattr(self, func.__name__, func)
             self.allowed_tasks.add(func.__name__)
+            self.register_server()
             return wrapper
         return decorator
 
     def start_worker(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            return  # Worker is already running
+
         self.check_middleware("before_worker_boot")
         def worker_loop():
             while True:
-                task_data = self.redis_client.blpop("ml_tasks")
-                if task_data:
-                    _, task_json = task_data
-                    task_dict = json.loads(task_json)
-                    print(task_dict)
-                    task = Task.from_dict(task_dict)
-                    print(task)
-                    try:
-                        self.process_task(task)
-                    except TaskProcessingError as e:
-                        print(f"Error processing task: {e}")
-        worker_thread = threading.Thread(target=worker_loop)
-        worker_thread.daemon = True
-        worker_thread.start()
+                try:
+                    # Update server status to idle while waiting for tasks
+                    self.update_server_status("idle")
+                    task_data = self.redis_client.blpop("ml_tasks")
+                    if task_data:
+                        # Update server status to busy when a task is picked up
+                        self.update_server_status("busy")
+                        _, task_json = task_data
+                        task_dict = json.loads(task_json)
+                        task = Task.from_dict(task_dict)
+                        if task.task_name in self.allowed_tasks:
+                            try:
+                                self.process_task(task)
+                            except TaskProcessingError as e:
+                                print(f"Error processing task: {e}")
+                        else:
+                            # Requeue the task if this server cannot process it
+                            self.redis_client.rpush("ml_tasks", task_json)
+                except Exception as e:
+                    print(f"Worker crashed with error: {e}. Restarting worker...")
+        
+        self.worker_thread = threading.Thread(target=worker_loop)
+        self.worker_thread.daemon = True
+        self.worker_thread.start()
 
     def check_middleware(self, middleware_event: str):
         print(f"got {middleware_event}")

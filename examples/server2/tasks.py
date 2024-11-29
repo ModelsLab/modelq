@@ -33,10 +33,6 @@ def stream(params):
 def add_task():
     return 2 + 3
 
-@modelq.task(timeout=15)
-def image_task():
-    return Image.open("IMG_5874.jfif")
-
 modelq.start_worker()
 
 
