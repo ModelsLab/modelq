@@ -81,8 +81,8 @@ class ModelQ:
 
         self.redis_client.rpush("ml_tasks", json.dumps(task))
 
-    def task(self, task_class=Task, timeout: Optional[int] = None, stream: bool = False):
-        """Decorator to create a task. Allows specifying a custom task class, timeout, and streaming support."""
+    def task(self, task_class=Task, timeout: Optional[int] = None, stream: bool = False, retries: int = 0):
+        """Decorator to create a task. Allows specifying a custom task class, timeout, streaming support, and retries."""
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
@@ -91,7 +91,8 @@ class ModelQ:
                     "args": args,
                     "kwargs": kwargs,
                     "timeout": timeout,
-                    "stream": stream
+                    "stream": stream,
+                    "retries": retries
                 }
                 task = task_class(task_name=task_name, payload=payload)
                 if stream:
@@ -129,6 +130,14 @@ class ModelQ:
                                 self.process_task(task)
                             except TaskProcessingError as e:
                                 print(f"Error processing task: {e}")
+                                if task.payload.get("retries", 0) > 0:
+                                    task.payload["retries"] -= 1
+                                    self.enqueue_task(task.to_dict(), payload=task.payload)
+                            except Exception as e:
+                                print(f"Unexpected error: {e}")
+                                if task.payload.get("retries", 0) > 0:
+                                    task.payload["retries"] -= 1
+                                    self.enqueue_task(task.to_dict(), payload=task.payload)
                         else:
                             # Requeue the task if this server cannot process it
                             self.redis_client.rpush("ml_tasks", task_json)
