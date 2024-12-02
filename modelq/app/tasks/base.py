@@ -3,61 +3,86 @@ import time
 import json
 import redis
 import sqlite3
-from typing import Any , Optional, Generator
+import base64
+from typing import Any, Optional, Generator
 from modelq.exceptions import TaskTimeoutError
+from PIL import Image, PngImagePlugin
+import io
 
 
-class Task :
+class Task:
 
-    def __init__(self,task_name : str , payload : dict,timeout : int = 15):
+    def __init__(self, task_name: str, payload: dict, timeout: int = 15):
         self.task_id = str(uuid.uuid4())
-        self.task_name = task_name 
+        self.task_name = task_name
         self.payload = payload
         self.status = "queued"
-        self.result = None 
+        self.result = None
         self.timestamp = time.time()
         self.timeout = timeout
         self.stream = False
         self.combined_result = ""
 
-    def to_dict(self) :
+    def to_dict(self):
         return {
-            "task_id" : self.task_id,
-            "task_name" : self.task_name,
-            "payload" : self.payload,
-            "status" : self.status,
-            "result" : self.result,
-            "timestamp" : self.timestamp,
+            "task_id": self.task_id,
+            "task_name": self.task_name,
+            "payload": self.payload,
+            "status": self.status,
+            "result": self.result,
+            "timestamp": self.timestamp,
             "stream": self.stream
         }
-    
+
     @staticmethod
-    def from_dict(data : dict ) -> 'Task' :
-        task = Task(task_name = data["task_name"],payload = data["payload"])
+    def from_dict(data: dict) -> 'Task':
+        task = Task(task_name=data["task_name"], payload=data["payload"])
         task.task_id = data["task_id"]
         task.status = data["status"]
         task.result = data.get("result")
         task.timestamp = data["timestamp"]
         task.stream = data.get("stream", False)
         return task
-    
+
+    def _convert_to_string(self, data: Any) -> str:
+        """Converts any data type to a string representation, including PIL images."""
+        # print(type(data))
+        try:
+            if isinstance(data, (dict, list, int, float, bool)):
+                return json.dumps(data)
+            elif isinstance(data, (Image.Image, PngImagePlugin.PngImageFile)):
+                print("here")
+                buffered = io.BytesIO()
+                data.save(buffered, format="PNG")
+                return "data:image/png;base64," + base64.b64encode(buffered.getvalue()).decode("utf-8")
+            return str(data)
+        except TypeError:
+            return str(data)
+
     def store_in_cache(self, db_path: str = "cache.db") -> None:
         """Stores the task in the SQLite cache database."""
         with sqlite3.connect(db_path) as conn:
             cursor = conn.cursor()
+            task_id = self._convert_to_string(self.task_id)
+            task_name = self._convert_to_string(self.task_name)
+            payload = self._convert_to_string(self.payload)
+            status = self._convert_to_string(self.status)
+            result = self._convert_to_string(self.result)
+            timestamp = self.timestamp if isinstance(self.timestamp, (int, float)) else None
+
             cursor.execute(
                 '''
                 INSERT OR REPLACE INTO tasks (task_id, task_name, payload, status, result, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ''',
-                (self.task_id, self.task_name, json.dumps(self.payload), self.status, self.result, self.timestamp)
+                (task_id, task_name, payload, status, result, timestamp)
             )
             conn.commit()
 
     def get_result(self, redis_client: redis.Redis, timeout: int = None) -> Any:
         """Waits for the result of the task until the timeout."""
 
-        if not timeout :
+        if not timeout:
             timeout = self.timeout
 
         start_time = time.time()

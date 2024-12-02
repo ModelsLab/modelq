@@ -16,20 +16,21 @@ def add_streaming(a, b, c):
 @celery_ml.task(timeout=15, retries=3)
 def add(a, b, c):
       # This will trigger a timeout error to test retries
-    raise Exception("Lmao")
-    # return a + b + c
+    # raise Exception("Lmao")
+    return [a + b + c]
     
 
-celery_ml.start_worker()
+celery_ml.start_workers()
 
 try:
     # Testing regular task with retry mechanism
     result_add = add(3, 4, 5)
     print(f"Result of add(3, 4, 5): {result_add}")
-    result_add.get_result(celery_ml.redis_client)
+    output = result_add.get_result(celery_ml.redis_client)
+    print(output)
 
     # Testing streaming task with retry mechanism
-    result_add_streaming_task = add_streaming(1, 2, 3)
+    # result_add_streaming_task = add_streaming(1, 2, 3)
     # output = result_add_streaming_task.get_stream(celery_ml.redis_client)
     # print(output)
     # for result in output:

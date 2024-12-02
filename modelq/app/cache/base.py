@@ -1,15 +1,12 @@
 import sqlite3
 import os
-import sys
-import click
 import json
-
-from modelq.app.tasks import Task
 from typing import Optional
+from modelq.app.tasks import Task
 
-class Cache :
+class Cache:
 
-    def __init__(self,db_path : str = "cache.db") -> None:
+    def __init__(self, db_path: str = "cache.db") -> None:
         self.db_path = db_path
         self._initialize_db()
     
@@ -32,16 +29,32 @@ class Cache :
                 )
                 conn.commit()
     
+    def _convert_to_string(self, data) -> str:
+        """Converts any data type to a string representation."""
+        try:
+            if isinstance(data, (dict, list, int, float, bool)):
+                return json.dumps(data)
+            return str(data)
+        except TypeError:
+            return str(data)
+
     def store_task(self, task: Task) -> None:
         """Stores a new task or updates an existing one in the SQLite database."""
         with sqlite3.connect(self.db_path) as conn:
             cursor = conn.cursor()
+            task_id = self._convert_to_string(task.task_id)
+            task_name = self._convert_to_string(task.task_name)
+            payload = self._convert_to_string(task.payload)
+            status = self._convert_to_string(task.status)
+            result = self._convert_to_string(task.result)
+            timestamp = task.timestamp if isinstance(task.timestamp, (int, float)) else None
+
             cursor.execute(
                 '''
                 INSERT OR REPLACE INTO tasks (task_id, task_name, payload, status, result, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ''',
-                (task.task_id, task.task_name, json.dumps(task.payload), task.status, task.result, task.timestamp)
+                (task_id, task_name, payload, status, result, timestamp)
             )
             conn.commit()
 
@@ -57,7 +70,7 @@ class Cache :
                     "task_name": row[1],
                     "payload": json.loads(row[2]),
                     "status": row[3],
-                    "result": row[4],
+                    "result": json.loads(row[4]) if row[4] and row[4].startswith(('{', '[')) else row[4],
                     "timestamp": row[5]
                 })
             return None
