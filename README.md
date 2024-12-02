@@ -86,5 +86,3 @@ ModelQ is licensed under the MIT License. See `LICENSE` for more information.
 - **Redis**: Used for backend queuing and task management.
 - **Celery**: Inspiration for improving task management for machine learning-specific workloads.
 
-## Contact
-If you have any questions or need help, feel free to contact us at [your_email@example.com].
