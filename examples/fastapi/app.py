@@ -4,6 +4,7 @@ from fastapi.responses import StreamingResponse , Response
 from PIL import Image
 import io
 import time
+from modelq.app.utils import base64_to_image
 
 app = FastAPI()
 
@@ -23,7 +24,8 @@ async def completion(question: str):
 async def image_app():
     task = image_task()
     result = task.get_result(modelq.redis_client)
-    print(result)
+    # print(result)
+    result = base64_to_image(result)
     if isinstance(result, Image.Image):
         img_byte_arr = image_to_bytes(result)
         return Response(content=img_byte_arr, media_type="image/png")

@@ -35,8 +35,8 @@ def add_task():
 
 @modelq.task(timeout=15)
 def image_task():
-    return Image.open("IMG_5874.jfif")
+    return Image.open("lmao.png")
 
-modelq.start_worker()
+modelq.start_workers()
 
 
