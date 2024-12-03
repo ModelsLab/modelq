@@ -175,7 +175,7 @@ class ModelQ:
         def worker_loop(worker_id):
             while True:
                 try:
-                    # Update server status to idle while waiting for tasks
+                # Update server status to idle while waiting for tasks
                     self.update_server_status(f"worker_{worker_id}: idle")
                     task_data = self.redis_client.blpop("ml_tasks")
                     if task_data:
@@ -359,30 +359,21 @@ class ModelQ:
         with sqlite3.connect(self.cache_db_path) as conn:
             cursor = conn.cursor()
             cursor.execute(
-                "SELECT task_id, task_name, status, payload FROM tasks WHERE status = ?",
+                "SELECT task_id, task_name, status, payload, timestamp FROM tasks WHERE status = ?",
                 ("queued",),
             )
             rows = cursor.fetchall()
             queued_tasks = []
             for row in rows:
-                task_id, task_name, status, payload = row
+                task_id, task_name, status, payload, timestamp = row
                 payload = json.loads(payload)
-                data = {
-                    "task_id": task_id,
-                    "task_name": task_name,
-                    "payload": payload,
-                    "status": status,
-                    "result": None,
-                    "timestamp": time.time(),
-                    "stream": payload.get("stream", False),
-                }
-                # Check if the task is not in Redis queue, then requeue it
                 queued_tasks.append(
                     {
                         "task_id": task_id,
                         "task_name": task_name,
                         "status": status,
                         "payload": payload,
+                        "timestamp": timestamp,
                     }
                 )
             return queued_tasks
