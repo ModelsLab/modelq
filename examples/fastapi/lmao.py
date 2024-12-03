@@ -43,4 +43,12 @@ def image_task():
     return Image.open("lmao.png")
 
 
-modelq.start_workers()
+if __name__ == "__main__":
+    modelq.start_workers()
+
+    # Keep the worker running indefinitely
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        print("\nGracefully shutting down...")

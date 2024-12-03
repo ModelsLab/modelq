@@ -31,11 +31,11 @@ class Task:
             "status": self.status,
             "result": self.result,
             "timestamp": self.timestamp,
-            "stream": self.stream
+            "stream": self.stream,
         }
 
     @staticmethod
-    def from_dict(data: dict) -> 'Task':
+    def from_dict(data: dict) -> "Task":
         task = Task(task_name=data["task_name"], payload=data["payload"])
         task.task_id = data["task_id"]
         task.status = data["status"]
@@ -54,7 +54,9 @@ class Task:
                 print("here")
                 buffered = io.BytesIO()
                 data.save(buffered, format="PNG")
-                return "data:image/png;base64," + base64.b64encode(buffered.getvalue()).decode("utf-8")
+                return "data:image/png;base64," + base64.b64encode(
+                    buffered.getvalue()
+                ).decode("utf-8")
             return str(data)
         except TypeError:
             return str(data)
@@ -68,14 +70,16 @@ class Task:
             payload = self._convert_to_string(self.payload)
             status = self._convert_to_string(self.status)
             result = self._convert_to_string(self.result)
-            timestamp = self.timestamp if isinstance(self.timestamp, (int, float)) else None
+            timestamp = (
+                self.timestamp if isinstance(self.timestamp, (int, float)) else None
+            )
 
             cursor.execute(
-                '''
+                """
                 INSERT OR REPLACE INTO tasks (task_id, task_name, payload, status, result, timestamp)
                 VALUES (?, ?, ?, ?, ?, ?)
-                ''',
-                (task_id, task_name, payload, status, result, timestamp)
+                """,
+                (task_id, task_name, payload, status, result, timestamp),
             )
             conn.commit()
 

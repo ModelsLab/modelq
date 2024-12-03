@@ -6,6 +6,7 @@ celery_ml = ModelQ()
 
 print(celery_ml)
 
+
 @celery_ml.task(timeout=15, stream=True, retries=2)
 def add_streaming(a, b, c):
     for i in range(1, 6):
@@ -13,12 +14,13 @@ def add_streaming(a, b, c):
         yield f"Intermediate result {i}: {a + b + c}"
     return a + b + c
 
+
 @celery_ml.task(timeout=15, retries=3)
 def add(a, b, c):
-      # This will trigger a timeout error to test retries
+    # This will trigger a timeout error to test retries
     # raise Exception("Lmao")
     return [a + b + c]
-    
+
 
 celery_ml.start_workers()
 
