@@ -57,6 +57,7 @@ class ModelQ:
         self.middleware: Middleware = None
         self.register_server()
         self.worker_threads = []
+        self.requeue_cached_tasks()
 
     def _connect_to_redis(
         self,
@@ -111,13 +112,23 @@ class ModelQ:
         queue = self.redis_client.lrange("ml_tasks", 0, -1)
         for item in queue:
             task = json.loads(item)
-            print(task)
-            logger.info(
-                f"task {str(task.get('task_id'))}"
-            )
             if task.get("task_id") == task_id:
                 return True
         return False
+
+    def requeue_cached_tasks(self):
+        """Requeues tasks from the cache database if they are not in Redis."""
+        queued_tasks = self.get_all_queued_tasks()
+        for task in queued_tasks:
+            task_id = task["task_id"]
+            if not self._is_task_in_queue(task_id) and not self.is_task_processing_or_executed(task_id):
+                logger.info(f"Requeueing task {task_id} from cache to Redis queue.")
+                self.redis_client.rpush("ml_tasks", json.dumps(task))
+
+    def is_task_processing_or_executed(self, task_id: str) -> bool:
+        """Check if a task is currently being processed or has already been executed."""
+        task_status = self.get_task_status(task_id)
+        return task_status in ["processing", "completed"]
 
     def task(
         self,
