@@ -35,6 +35,7 @@ def stream(params):
 
 @modelq.task(timeout=15)
 def add_task():
+    time.sleep(1)
     return 2 + 3
 
 
