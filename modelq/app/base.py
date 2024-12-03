@@ -98,8 +98,26 @@ class ModelQ:
 
     def enqueue_task(self, task_name: str, payload: dict):
         task = {**task_name, "status": "queued"}
+        task_id = task.get("task_id")
 
-        self.redis_client.rpush("ml_tasks", json.dumps(task))
+        # Check if the task is already in the queue
+        if not self._is_task_in_queue(task_id):
+            self.redis_client.rpush("ml_tasks", json.dumps(task))
+        else:
+            logger.warning(f"Task {task_id} is already in the queue, skipping enqueue.")
+
+    def _is_task_in_queue(self, task_id: str) -> bool:
+        """Check if a task with the given task_id is already in the ml_tasks queue."""
+        queue = self.redis_client.lrange("ml_tasks", 0, -1)
+        for item in queue:
+            task = json.loads(item)
+            print(task)
+            logger.info(
+                f"task {str(task.get('task_id'))}"
+            )
+            if task.get("task_id") == task_id:
+                return True
+        return False
 
     def task(
         self,
@@ -347,12 +365,7 @@ class ModelQ:
                     "timestamp": time.time(),
                     "stream": payload.get("stream", False),
                 }
-                # Check if the task is not in Redis, then requeue it
-                if not self.redis_client.exists(f"task_result:{task_id}"):
-                    logger.warning(
-                        f"Task {task_id} with status 'queued' found in cache but not in Redis. Re-queuing task."
-                    )
-                    self.enqueue_task(data, payload)
+                # Check if the task is not in Redis queue, then requeue it
                 queued_tasks.append(
                     {
                         "task_id": task_id,
