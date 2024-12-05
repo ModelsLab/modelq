@@ -2,7 +2,6 @@ import uuid
 import time
 import json
 import redis
-import sqlite3
 import base64
 from typing import Any, Optional, Generator
 from modelq.exceptions import TaskTimeoutError
@@ -46,12 +45,10 @@ class Task:
 
     def _convert_to_string(self, data: Any) -> str:
         """Converts any data type to a string representation, including PIL images."""
-        # print(type(data))
         try:
             if isinstance(data, (dict, list, int, float, bool)):
                 return json.dumps(data)
             elif isinstance(data, (Image.Image, PngImagePlugin.PngImageFile)):
-                print("here")
                 buffered = io.BytesIO()
                 data.save(buffered, format="PNG")
                 return "data:image/png;base64," + base64.b64encode(
@@ -60,28 +57,6 @@ class Task:
             return str(data)
         except TypeError:
             return str(data)
-
-    def store_in_cache(self, db_path: str = "cache.db") -> None:
-        """Stores the task in the SQLite cache database."""
-        with sqlite3.connect(db_path) as conn:
-            cursor = conn.cursor()
-            task_id = self._convert_to_string(self.task_id)
-            task_name = self._convert_to_string(self.task_name)
-            payload = self._convert_to_string(self.payload)
-            status = self._convert_to_string(self.status)
-            result = self._convert_to_string(self.result)
-            timestamp = (
-                self.timestamp if isinstance(self.timestamp, (int, float)) else None
-            )
-
-            cursor.execute(
-                """
-                INSERT OR REPLACE INTO tasks (task_id, task_name, payload, status, result, timestamp)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (task_id, task_name, payload, status, result, timestamp),
-            )
-            conn.commit()
 
     def get_result(self, redis_client: redis.Redis, timeout: int = None) -> Any:
         """Waits for the result of the task until the timeout."""
@@ -96,8 +71,6 @@ class Task:
                 task_data = json.loads(task_json)
                 self.result = task_data.get("result")
                 self.status = task_data.get("status")
-                # Store the updated task status in cache
-                self.store_in_cache()
                 return self.result
             time.sleep(1)
         raise TaskTimeoutError(self.task_id)
@@ -124,8 +97,7 @@ class Task:
                 task_data = json.loads(task_json)
                 if task_data.get("status") == "completed":
                     completed = True
-                    # Store the completed task status and combined result in cache
+                    # Store the completed task status and combined result in Redis
                     self.status = "completed"
                     self.result = self.combined_result
-                    self.store_in_cache()
         return

@@ -4,12 +4,10 @@ import json
 import functools
 import threading
 import time
-import sqlite3
 import uuid
 import logging
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError
-from modelq.app.cache import Cache
 from modelq.app.middleware import Middleware
 
 # Set up logging configuration
@@ -32,7 +30,6 @@ class ModelQ:
         password: str = None,
         ssl: bool = False,
         ssl_cert_reqs: any = None,
-        cache_db_path: str = "cache.db",
         redis_client: Any = None,
         **kwargs,
     ):
@@ -51,8 +48,6 @@ class ModelQ:
             )
         self.server_id = server_id or str(uuid.uuid4())
         self.allowed_tasks = set()
-        self.cache_db_path = cache_db_path
-        self.cache = Cache(db_path=cache_db_path)
         self.task_configurations: Dict[str, Dict[str, Any]] = {}
         self.middleware: Middleware = None
         self.register_server()
@@ -117,12 +112,12 @@ class ModelQ:
         return False
 
     def requeue_cached_tasks(self):
-        """Requeues tasks from the cache database if they are not in Redis."""
+        """Requeues tasks from Redis if they are not in the queue."""
         queued_tasks = self.get_all_queued_tasks()
         for task in queued_tasks:
             task_id = task["task_id"]
             if not self._is_task_in_queue(task_id) and not self.is_task_processing_or_executed(task_id):
-                logger.info(f"Requeueing task {task_id} from cache to Redis queue.")
+                logger.info(f"Requeueing task {task_id} from Redis to queue.")
                 self.redis_client.rpush("ml_tasks", json.dumps(task))
 
     def is_task_processing_or_executed(self, task_id: str) -> bool:
@@ -154,8 +149,8 @@ class ModelQ:
                 if stream:
                     task.stream = True
                 self.enqueue_task(task.to_dict(), payload=payload)
-                # Store task in cache
-                task.store_in_cache(self.cache_db_path)
+                # Store task in Redis
+                self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
                 return task
 
             # Attach the function to the instance so it can be called by process_task
@@ -175,7 +170,7 @@ class ModelQ:
         def worker_loop(worker_id):
             while True:
                 try:
-                # Update server status to idle while waiting for tasks
+                    # Update server status to idle while waiting for tasks
                     self.update_server_status(f"worker_{worker_id}: idle")
                     task_data = self.redis_client.blpop("ml_tasks")
                     if task_data:
@@ -296,8 +291,8 @@ class ModelQ:
                     logger.info(
                         f"Task {task.task_name} completed successfully in {end_time - start_time:.2f} seconds"
                     )
-                    # Store updated task status in cache
-                    task.store_in_cache(self.cache_db_path)
+                    # Store updated task status in Redis
+                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
                 except Exception as e:
                     task.status = "failed"
                     task.result = str(e)
@@ -306,8 +301,8 @@ class ModelQ:
                         json.dumps(task.to_dict()),
                         ex=3600,
                     )
-                    # Store failed task status in cache
-                    task.store_in_cache(self.cache_db_path)
+                    # Store failed task status in Redis
+                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
                     logger.error(f"Task {task.task_name} failed with error: {e}")
                     raise TaskProcessingError(task.task_name, str(e))
             else:
@@ -316,8 +311,8 @@ class ModelQ:
                 self.redis_client.set(
                     f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600
                 )
-                # Store failed task status in cache
-                task.store_in_cache(self.cache_db_path)
+                # Store failed task status in Redis
+                self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
                 logger.error(
                     f"Task {task.task_name} failed because the task function was not found"
                 )
@@ -328,8 +323,8 @@ class ModelQ:
             self.redis_client.set(
                 f"task_result:{task.task_id}", json.dumps(task.to_dict()), ex=3600
             )
-            # Store failed task status in cache
-            task.store_in_cache(self.cache_db_path)
+            # Store failed task status in Redis
+            self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
             logger.error(f"Task {task.task_name} is not allowed")
             raise TaskProcessingError(task.task_name, "Task not allowed")
 
@@ -355,35 +350,19 @@ class ModelQ:
         return result[0]
 
     def get_all_queued_tasks(self) -> list:
-        """Retrieves all tasks with status 'queued' from the SQLite cache database."""
-        with sqlite3.connect(self.cache_db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute(
-                "SELECT task_id, task_name, status, payload, timestamp FROM tasks WHERE status = ?",
-                ("queued",),
-            )
-            rows = cursor.fetchall()
-            queued_tasks = []
-            for row in rows:
-                task_id, task_name, status, payload, timestamp = row
-                payload = json.loads(payload)
-                queued_tasks.append(
-                    {
-                        "task_id": task_id,
-                        "task_name": task_name,
-                        "status": status,
-                        "payload": payload,
-                        "timestamp": timestamp,
-                    }
-                )
-            return queued_tasks
+        """Retrieves all tasks with status 'queued' from Redis."""
+        keys = self.redis_client.keys("task:*")
+        queued_tasks = []
+        for key in keys:
+            task_data = json.loads(self.redis_client.get(key))
+            if task_data["status"] == "queued":
+                queued_tasks.append(task_data)
+        return queued_tasks
 
     def get_task_status(self, task_id: str) -> Optional[str]:
-        """Retrieves the status of a particular task by task ID from the SQLite cache database."""
-        with sqlite3.connect(self.cache_db_path) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT status FROM tasks WHERE task_id = ?", (task_id,))
-            row = cursor.fetchone()
-            if row:
-                return row[0]
-            return None
+        """Retrieves the status of a particular task by task ID from Redis."""
+        task_data = self.redis_client.get(f"task:{task_id}")
+        if task_data:
+            task = json.loads(task_data)
+            return task.get("status")
+        return None
