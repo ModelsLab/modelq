@@ -8,11 +8,15 @@ import logging
 import traceback
 from typing import Optional, Dict, Any
 
+import requests  # <-- NEW: To send error payloads to a webhook
+
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError
 from modelq.app.middleware import Middleware
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+logging.basicConfig(
+    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger(__name__)
 
 
@@ -28,13 +32,10 @@ class ModelQ:
         ssl: bool = False,
         ssl_cert_reqs: Any = None,
         redis_client: Any = None,
-        max_connections: int = 50,
-        # NOTE: We remove the process-based concurrency to avoid pickle issues
+        max_connections: int = 50,  # Limit max connections to avoid "too many clients"
+        webhook_url: Optional[str] = None,  # <-- NEW: optional webhook for error logging
         **kwargs,
     ):
-        """
-        ModelQ constructor. Initializes Redis client.
-        """
         if redis_client:
             self.redis_client = redis_client
         else:
@@ -49,18 +50,17 @@ class ModelQ:
                 max_connections=max_connections,
                 **kwargs,
             )
-
-        # We no longer use a ProcessPoolExecutor. We'll do thread-based timeout checks.
         self.worker_threads = []
         self.server_id = server_id or str(uuid.uuid4())
         self.allowed_tasks = set()
         self.task_configurations: Dict[str, Dict[str, Any]] = {}
-
-        # Optional middleware
         self.middleware: Middleware = None
 
-        # Register this server in Redis
+        # NEW: Store the webhook URL
+        self.webhook_url = webhook_url
+
         self.register_server()
+        self.requeue_inprogress_tasks()
 
     def _connect_to_redis(
         self,
@@ -74,9 +74,6 @@ class ModelQ:
         max_connections: int = 50,
         **kwargs,
     ) -> redis.Redis:
-        """
-        Connect to Redis using a connection pool.
-        """
         pool = redis.ConnectionPool(
             host=host,
             port=port,
@@ -90,9 +87,6 @@ class ModelQ:
         return redis.Redis(connection_pool=pool)
 
     def register_server(self):
-        """
-        Register or update server in Redis under "servers" hash.
-        """
         self.redis_client.hset(
             "servers",
             self.server_id,
@@ -100,44 +94,54 @@ class ModelQ:
         )
 
     def update_server_status(self, status: str):
-        """
-        Update server's status ("idle", "busy", etc.) in Redis.
-        """
-        server_data_raw = self.redis_client.hget("servers", self.server_id)
-        if server_data_raw:
-            server_data = json.loads(server_data_raw)
-        else:
-            server_data = {}
-
+        server_data = json.loads(self.redis_client.hget("servers", self.server_id))
         server_data["status"] = status
         self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
 
     def enqueue_task(self, task_name: dict, payload: dict):
-        """
-        Enqueue a task into the Redis list "ml_tasks" if not already queued.
-        task_name is actually a dictionary, from task.to_dict().
-        """
         task = {**task_name, "status": "queued"}
         task_id = task.get("task_id")
 
         if not self._is_task_in_queue(task_id):
             with self.redis_client.pipeline() as pipe:
                 pipe.rpush("ml_tasks", json.dumps(task))
-                pipe.sadd("queued_tasks", task_id)  # track queued tasks in a set
+                pipe.sadd("queued_tasks", task_id)
                 pipe.execute()
         else:
             logger.warning(f"Task {task_id} is already in the queue, skipping enqueue.")
 
     def _is_task_in_queue(self, task_id: str) -> bool:
-        """
-        Check if a task ID is in "queued_tasks" set. O(1) membership test.
-        """
         return self.redis_client.sismember("queued_tasks", task_id)
 
+    def requeue_cached_tasks(self):
+        """
+        (Optional) Re-queue tasks that might be in 'queued_tasks' set
+        but missing in 'ml_tasks' list. Currently a placeholder.
+        """
+        pass
+
+    def requeue_inprogress_tasks(self):
+        """
+        On server startup, re-queue tasks that were marked 'processing' but never finished.
+        """
+        logger.info("Checking for in-progress tasks to re-queue on startup...")
+        processing_task_ids = self.redis_client.smembers("processing_tasks")
+        for pid in processing_task_ids:
+            task_id = pid.decode("utf-8")
+            task_data = self.redis_client.get(f"task:{task_id}")
+            if not task_data:
+                self.redis_client.srem("processing_tasks", task_id)
+                logger.warning(f"No record found for in-progress task {task_id}. Removing it.")
+                continue
+
+            task_dict = json.loads(task_data)
+            if task_dict.get("status") == "processing":
+                logger.info(f"Re-queuing task {task_id} which was in progress.")
+                self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
+                self.redis_client.sadd("queued_tasks", task_id)
+                self.redis_client.srem("processing_tasks", task_id)
+
     def get_all_queued_tasks(self) -> list:
-        """
-        Example method to return all queued tasks (in 'queued_tasks' set).
-        """
         queued_task_ids = self.redis_client.smembers("queued_tasks")
         queued_tasks = []
         if queued_task_ids:
@@ -145,7 +149,6 @@ class ModelQ:
                 for t_id in queued_task_ids:
                     pipe.get(f"task:{t_id.decode('utf-8')}")
                 results = pipe.execute()
-
             for res in results:
                 if res:
                     task_data = json.loads(res)
@@ -154,9 +157,6 @@ class ModelQ:
         return queued_tasks
 
     def is_task_processing_or_executed(self, task_id: str) -> bool:
-        """
-        Check if a task is already processing or completed by looking up its status.
-        """
         task_status = self.get_task_status(task_id)
         return task_status in ["processing", "completed"]
 
@@ -167,13 +167,6 @@ class ModelQ:
         stream: bool = False,
         retries: int = 0,
     ):
-        """
-        Decorator to define a task. For example:
-
-        @modelq.task(timeout=30, retries=1)
-        def my_task_function(x, y):
-            return x + y
-        """
         def decorator(func):
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
@@ -188,28 +181,19 @@ class ModelQ:
                 task = task_class(task_name=task_name, payload=payload)
                 if stream:
                     task.stream = True
-                # Enqueue and store in Redis
                 self.enqueue_task(task.to_dict(), payload=payload)
                 self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
                 return task
 
-            # Register this function name as an allowed task
             setattr(self, func.__name__, func)
             self.allowed_tasks.add(func.__name__)
             self.register_server()
-
             return wrapper
-
         return decorator
 
     def start_workers(self, no_of_workers: int = 1):
-        """
-        Start worker threads which pop tasks from "ml_tasks" queue.
-        We'll do short blocking intervals to make pickup more responsive.
-        """
-        # Ensure we only start workers once
         if any(thread.is_alive() for thread in self.worker_threads):
-            return
+            return  # Workers are already running
 
         self.check_middleware("before_worker_boot")
 
@@ -217,58 +201,50 @@ class ModelQ:
             while True:
                 try:
                     self.update_server_status(f"worker_{worker_id}: idle")
+                    task_data = self.redis_client.blpop("ml_tasks")
+                    if task_data:
+                        self.update_server_status(f"worker_{worker_id}: busy")
+                        _, task_json = task_data
+                        task_dict = json.loads(task_json)
+                        task = Task.from_dict(task_dict)
 
-                    # Short-block on "ml_tasks" for 2 seconds
-                    task_data = self.redis_client.blpop("ml_tasks", timeout=2)
-                    if not task_data:
-                        # No task popped in 2s, loop again
-                        continue
+                        self.redis_client.srem("queued_tasks", task.task_id)
+                        self.redis_client.sadd("processing_tasks", task.task_id)
 
-                    self.update_server_status(f"worker_{worker_id}: busy")
-                    _, task_json = task_data
-                    task_dict = json.loads(task_json)
-                    task = Task.from_dict(task_dict)
+                        task.status = "processing"
+                        self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
 
-                    # Remove from queued set
-                    self.redis_client.srem("queued_tasks", task.task_id)
-
-                    if task.task_name in self.allowed_tasks:
-                        try:
-                            logger.info(
-                                f"Worker {worker_id} started processing task: {task.task_name}"
-                            )
-                            start_time = time.time()
-                            self.process_task(task)
-                            end_time = time.time()
-                            logger.info(
-                                f"Worker {worker_id} finished task: {task.task_name} "
-                                f"in {end_time - start_time:.2f} seconds"
-                            )
-                        except TaskProcessingError as e:
-                            logger.error(
-                                f"Worker {worker_id} encountered a TaskProcessingError "
-                                f"while processing task '{task.task_name}': {e}"
-                            )
-                            # Re-enqueue if retries remain
-                            if task.payload.get("retries", 0) > 0:
-                                task.payload["retries"] -= 1
-                                self.enqueue_task(task.to_dict(), payload=task.payload)
-                        except Exception as e:
-                            logger.error(
-                                f"Worker {worker_id} encountered an unexpected error "
-                                f"while processing task '{task.task_name}': {e}"
-                            )
-                            # Re-enqueue if retries remain
-                            if task.payload.get("retries", 0) > 0:
-                                task.payload["retries"] -= 1
-                                self.enqueue_task(task.to_dict(), payload=task.payload)
-                    else:
-                        # This server can't process that task - requeue it
-                        with self.redis_client.pipeline() as pipe:
-                            pipe.rpush("ml_tasks", task_json)
-                            pipe.sadd("queued_tasks", task.task_id)
-                            pipe.execute()
-
+                        if task.task_name in self.allowed_tasks:
+                            try:
+                                logger.info(
+                                    f"Worker {worker_id} started processing task: {task.task_name}"
+                                )
+                                start_time = time.time()
+                                self.process_task(task)
+                                end_time = time.time()
+                                logger.info(
+                                    f"Worker {worker_id} finished task: {task.task_name} "
+                                    f"in {end_time - start_time:.2f} seconds"
+                                )
+                            except TaskProcessingError as e:
+                                logger.error(
+                                    f"Worker {worker_id} encountered a TaskProcessingError: {e}"
+                                )
+                                if task.payload.get("retries", 0) > 0:
+                                    task.payload["retries"] -= 1
+                                    self.enqueue_task(task.to_dict(), payload=task.payload)
+                            except Exception as e:
+                                logger.error(
+                                    f"Worker {worker_id} encountered an unexpected error: {e}"
+                                )
+                                if task.payload.get("retries", 0) > 0:
+                                    task.payload["retries"] -= 1
+                                    self.enqueue_task(task.to_dict(), payload=task.payload)
+                        else:
+                            with self.redis_client.pipeline() as pipe:
+                                pipe.rpush("ml_tasks", task_json)
+                                pipe.sadd("queued_tasks", task.task_id)
+                                pipe.execute()
                 except Exception as e:
                     logger.error(
                         f"Worker {worker_id} crashed with error: {e}. Restarting worker..."
@@ -289,180 +265,213 @@ class ModelQ:
         )
 
     def check_middleware(self, middleware_event: str):
-        """
-        Hook to run middleware if defined.
-        """
         logger.info(f"Middleware event triggered: {middleware_event}")
         if self.middleware:
             self.middleware.execute(event=middleware_event)
 
+    def log_task_error_to_file(self, task: Task, exc: Exception, file_path="modelq_errors.log"):
+        """
+        Logs detailed error info to a specified file, with dashes before and after.
+        Includes:
+          - Task ID
+          - Task name
+          - Task payload
+          - Error message
+          - Full traceback
+          - Timestamp
+        """
+        error_trace = traceback.format_exc()  # captures the full traceback
+        log_data = {
+            "task_id": task.task_id,
+            "task_name": task.task_name,
+            "payload": task.payload,
+            "error_message": str(exc),
+            "traceback": error_trace,
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime()),
+        }
+
+        with open(file_path, "a", encoding="utf-8") as f:
+            f.write("----\n")
+            f.write(json.dumps(log_data, indent=2))
+            f.write("\n----\n")
+
+    def post_error_to_webhook(self, task: Task, exc: Exception):
+        """
+        Non-blocking version that constructs the entire Discord message (content),
+        then spawns a thread to do the POST request.
+        """
+        if not self.webhook_url:
+            return  # No webhook configured, do nothing
+    
+        # Capture the full traceback from the current exception context
+        full_tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+    
+        payload_str = json.dumps(task.payload, indent=2)  # pretty-print the payload
+    
+        content_str = (
+            f"**Task Name**: {task.task_name}\n"
+            f"**Task ID**: {task.task_id}\n"
+            f"**Payload**:\n```json\n{payload_str}\n```\n"
+            f"**Error Message**: {exc}\n"
+            f"**Traceback**:\n```{full_tb}```"
+        )
+    
+        # Now we have the entire message. Let's pass it to a thread.
+        t = threading.Thread(
+            target=self._post_error_to_webhook_sync,
+            args=(content_str,),
+            daemon=True
+        )
+        t.start()
+    
+    def _post_error_to_webhook_sync(self, content_str: str):
+        """
+        Sends the message to Discord in blocking fashion. Called by a background thread.
+        """
+        payload = {"content": content_str}
+        try:
+            resp = requests.post(self.webhook_url, json=payload, timeout=10)
+            if resp.status_code >= 400:
+                logger.error(
+                    f"Failed to POST error to Discord webhook. "
+                    f"Status code: {resp.status_code}, Response: {resp.text}"
+                )
+        except Exception as e2:
+            logger.error(f"Exception while sending error to webhook: {e2}")
+
+
     def process_task(self, task: Task) -> None:
         """
-        Main function to process a task. If 'timeout' is provided, we run
-        the function in a separate thread with a join-based timeout.
-        WARNING: If the function is CPU-bound and does not cooperate,
-        it will not truly be killed when the timeout is reached.
+        Processes the task by calling the registered function.
         """
-        if task.task_name not in self.allowed_tasks:
-            task.status = "failed"
-            task.result = "Task not allowed"
-            self._save_task_result(task)
-            logger.error(f"Task {task.task_name} is not allowed")
-            raise TaskProcessingError(f"Task not allowed: {task.task_name}")
-
-        # Retrieve the actual function
-        task_function = getattr(self, task.task_name, None)
-        if not task_function:
-            task.status = "failed"
-            task.result = "Task function not found"
-            self._save_task_result(task)
-            logger.error(f"Task {task.task_name} failed because the task function was not found")
-            raise TaskProcessingError(f"Task function not found: {task.task_name}")
-
         try:
-            logger.info(
-                f"Processing task: {task.task_name} with args: {task.payload.get('args', [])} "
-                f"and kwargs: {task.payload.get('kwargs', {})}"
-            )
-            start_time = time.time()
-            timeout = task.payload.get("timeout", None)
-            stream = task.payload.get("stream", False)
-
-            # Indicate processing status in Redis
-            self._set_task_status(task.task_id, "processing")
-
-            if stream:
-                # For a generator function, yield partial results
-                for result in task_function(*task.payload.get("args", []),
-                                            **task.payload.get("kwargs", {})):
-                    task.status = "in_progress"
-                    # Push partial result to a Redis stream
-                    self.redis_client.xadd(
-                        f"task_stream:{task.task_id}",
-                        {"result": json.dumps(result)}
+            if task.task_name in self.allowed_tasks:
+                task_function = getattr(self, task.task_name, None)
+                if task_function:
+                    logger.info(
+                        f"Processing task: {task.task_name} "
+                        f"with args: {task.payload.get('args', [])} "
+                        f"and kwargs: {task.payload.get('kwargs', {})}"
                     )
-                task.status = "completed"
-                self._save_task_result(task)
-            else:
-                # Run with or without thread-based timeout
-                if timeout:
-                    result = self._run_with_timeout(
-                        task_function,
-                        timeout,
-                        *task.payload.get("args", []),
-                        **task.payload.get("kwargs", {})
+                    start_time = time.time()
+                    timeout = task.payload.get("timeout", None)
+                    stream = task.payload.get("stream", False)
+
+                    if stream:
+                        for result in task_function(
+                            *task.payload.get("args", []),
+                            **task.payload.get("kwargs", {})
+                        ):
+                            task.status = "in_progress"
+                            self.redis_client.xadd(
+                                f"task_stream:{task.task_id}",
+                                {"result": json.dumps(result)}
+                            )
+                        task.status = "completed"
+                        self.redis_client.set(
+                            f"task_result:{task.task_id}",
+                            json.dumps(task.to_dict()),
+                            ex=3600
+                        )
+                    else:
+                        if timeout:
+                            result = self._run_with_timeout(
+                                task_function,
+                                timeout,
+                                *task.payload.get("args", []),
+                                **task.payload.get("kwargs", {}),
+                            )
+                        else:
+                            result = task_function(
+                                *task.payload.get("args", []),
+                                **task.payload.get("kwargs", {}),
+                            )
+                        result_str = task._convert_to_string(result)
+                        task.result = result_str
+                        task.status = "completed"
+                        self.redis_client.set(
+                            f"task_result:{task.task_id}",
+                            json.dumps(task.to_dict()),
+                            ex=3600
+                        )
+
+                    end_time = time.time()
+                    logger.info(
+                        f"Task {task.task_name} completed successfully "
+                        f"in {end_time - start_time:.2f} seconds"
                     )
+                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
                 else:
-                    result = task_function(
-                        *task.payload.get("args", []),
-                        **task.payload.get("kwargs", {})
+                    task.status = "failed"
+                    task.result = "Task function not found"
+                    self.redis_client.set(
+                        f"task_result:{task.task_id}",
+                        json.dumps(task.to_dict()),
+                        ex=3600,
                     )
-
-                result_str = task._convert_to_string(result)
-                task.result = result_str
-                task.status = "completed"
-                self._save_task_result(task)
-
-            end_time = time.time()
-            logger.info(
-                f"Task {task.task_name} completed successfully "
-                f"in {end_time - start_time:.2f} seconds"
-            )
-
-            # Update main task object in Redis
-            self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
-
-        except TaskTimeoutError as te:
-            # Timeout specifically
-            self.check_middleware("on_timeout")
-            task.status = "failed"
-            task.result = f"Timeout: {str(te)}"
-            self._save_task_result(task)
-            # Publish failure so external code can handle it
-            self.redis_client.publish("task_failures", json.dumps({
-                "task_id": task.task_id,
-                "error": str(te)
-            }))
-            logger.error(f"Task {task.task_name} timed out: {te}")
-            raise TaskProcessingError(f"{task.task_name} timed out: {te}")
+                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
+                    logger.error(
+                        f"Task {task.task_name} failed because the task function was not found"
+                    )
+                    raise TaskProcessingError(task.task_name, "Task function not found")
+            else:
+                task.status = "failed"
+                task.result = "Task not allowed"
+                self.redis_client.set(
+                    f"task_result:{task.task_id}",
+                    json.dumps(task.to_dict()),
+                    ex=3600,
+                )
+                self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
+                logger.error(f"Task {task.task_name} is not allowed")
+                raise TaskProcessingError(task.task_name, "Task not allowed")
 
         except Exception as e:
-            # Generic failure: capture traceback
-            tb_str = traceback.format_exc()
-            full_error_msg = f"Task {task.task_name} failed with error:\n{tb_str}"
-
+            # Mark the task as failed
             task.status = "failed"
-            task.result = full_error_msg
-            self._save_task_result(task)
+            task.result = str(e)
+            self.redis_client.set(
+                f"task_result:{task.task_id}",
+                json.dumps(task.to_dict()),
+                ex=3600,
+            )
+            self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
 
-            # Publish failure so external code can handle it
-            self.redis_client.publish("task_failures", json.dumps({
-                "task_id": task.task_id,
-                "error": full_error_msg
-            }))
-            logger.error(full_error_msg)
-            raise TaskProcessingError(full_error_msg)
+            # 1) Log the error to file
+            self.log_task_error_to_file(task, e, file_path="modelq_errors.log")
+
+            # 2) POST the error to the webhook (if configured)
+            self.post_error_to_webhook(task, e)
+
+            logger.error(f"Task {task.task_name} failed with error: {e}")
+            raise TaskProcessingError(task.task_name, str(e))
+
+        finally:
+            self.redis_client.srem("processing_tasks", task.task_id)
 
     def _run_with_timeout(self, func, timeout, *args, **kwargs):
-        """
-        Thread-based timeout approach. This does NOT forcibly kill a CPU-bound function.
-        It starts a thread and waits up to 'timeout' seconds for it to complete.
-        If it doesn't complete, we raise TaskTimeoutError.
-        """
-
-        result_container = {"value": None}
-        error_container = {"exception": None}
+        result = [None]
+        exception = [None]
 
         def target():
             try:
-                result_container["value"] = func(*args, **kwargs)
+                result[0] = func(*args, **kwargs)
             except Exception as ex:
-                error_container["exception"] = ex
+                exception[0] = ex
 
-        thread = threading.Thread(target=target, daemon=True)
+        thread = threading.Thread(target=target)
         thread.start()
         thread.join(timeout)
-
         if thread.is_alive():
             logger.error(f"Task exceeded timeout of {timeout} seconds")
-            # The thread is still running, but we can't kill it forcibly.
             raise TaskTimeoutError(f"Task exceeded timeout of {timeout} seconds")
-
-        # If the function raised an exception inside the thread
-        if error_container["exception"]:
-            raise error_container["exception"]
-
-        return result_container["value"]
+        if exception[0]:
+            raise exception[0]
+        return result[0]
 
     def get_task_status(self, task_id: str) -> Optional[str]:
-        """
-        Return the status of a given task_id from Redis.
-        """
         task_data = self.redis_client.get(f"task:{task_id}")
         if task_data:
-            task_dict = json.loads(task_data)
-            return task_dict.get("status")
+            task = json.loads(task_data)
+            return task.get("status")
         return None
-
-    def _set_task_status(self, task_id: str, status: str):
-        """
-        Utility to update the 'status' of a task in Redis.
-        """
-        task_data = self.redis_client.get(f"task:{task_id}")
-        if not task_data:
-            return
-        task_dict = json.loads(task_data)
-        task_dict["status"] = status
-        self.redis_client.set(f"task:{task_id}", json.dumps(task_dict))
-
-    def _save_task_result(self, task: Task):
-        """
-        Save the task object in 'task_result' and the main 'task:ID' key in Redis.
-        Also sets a TTL of 1 hour on 'task_result' if you want some data expiration.
-        """
-        self.redis_client.set(
-            f"task_result:{task.task_id}",
-            json.dumps(task.to_dict()),
-            ex=3600,  # optional expiration
-        )
-        self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
