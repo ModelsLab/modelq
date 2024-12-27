@@ -4,7 +4,7 @@ import json
 import redis
 import base64
 from typing import Any, Optional, Generator
-from modelq.exceptions import TaskTimeoutError
+from modelq.exceptions import TaskTimeoutError, TaskProcessingError
 from PIL import Image, PngImagePlugin
 import io
 
@@ -59,7 +59,11 @@ class Task:
             return str(data)
 
     def get_result(self, redis_client: redis.Redis, timeout: int = None) -> Any:
-        """Waits for the result of the task until the timeout."""
+        """
+        Waits for the result of the task until the timeout.
+        Raises TaskProcessingError if the task failed,
+        or TaskTimeoutError if it never completes within the timeout.
+        """
 
         if not timeout:
             timeout = self.timeout
@@ -71,8 +75,21 @@ class Task:
                 task_data = json.loads(task_json)
                 self.result = task_data.get("result")
                 self.status = task_data.get("status")
-                return self.result
+
+                if self.status == "failed":
+                    # Raise the original error message as a TaskProcessingError
+                    error_message = self.result or "Task failed without an error message"
+                    raise TaskProcessingError(
+                        task_data.get("task_name", self.task_name),
+                        error_message
+                    )
+                elif self.status == "completed":
+                    return self.result
+                # If status is something else like 'processing', we keep polling
+
             time.sleep(1)
+
+        # If we exit the loop, we timed out waiting for a final status
         raise TaskTimeoutError(self.task_id)
 
     def get_stream(self, redis_client: redis.Redis) -> Generator[Any, None, None]:
@@ -91,7 +108,8 @@ class Task:
                         last_id = message_id
                         # Concatenate result for storing combined response
                         self.combined_result += result
-            # Check if the task is marked as completed after yielding current messages
+
+            # Check if the task is marked as completed (or failed) after yielding current messages
             task_json = redis_client.get(f"task_result:{self.task_id}")
             if task_json:
                 task_data = json.loads(task_json)
@@ -100,4 +118,12 @@ class Task:
                     # Store the completed task status and combined result in Redis
                     self.status = "completed"
                     self.result = self.combined_result
+                elif task_data.get("status") == "failed":
+                    # Optionally handle or raise an error for streaming tasks
+                    error_message = task_data.get("result", "Task failed without an error message")
+                    raise TaskProcessingError(
+                        task_data.get("task_name", self.task_name),
+                        error_message
+                    )
+
         return

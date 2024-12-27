@@ -7,9 +7,9 @@ class TaskTimeoutError(Exception):
 
 
 class TaskProcessingError(Exception):
-    """Custom exception to indicate an error occurred during task processing."""
-
-    def __init__(self, task_name: str, message: str):
-        super().__init__(f"Error processing task {task_name}: {message}")
-        self.task_name = task_name
-        self.message = message
+    """
+    A custom exception indicating something went wrong processing the task.
+    We only require one 'message' argument for simplicity.
+    """
+    def __init__(self, message: str):
+        super().__init__(message)
