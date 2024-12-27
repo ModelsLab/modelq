@@ -19,9 +19,3 @@ class Middleware(ABC):
         """Called before the worker process starts up."""
         pass
 
-    @abstractmethod
-    def on_timeout(self, *args, **kwargs):
-        """
-        Called if the task times out. You can pass pipeline or anything else here.
-        """
-        pass
