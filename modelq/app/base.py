@@ -61,6 +61,7 @@ class ModelQ:
 
         self.register_server()
         self.requeue_inprogress_tasks()
+        self.remove_cached_tasks()
 
     def _connect_to_redis(
         self,
