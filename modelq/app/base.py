@@ -113,12 +113,18 @@ class ModelQ:
     def _is_task_in_queue(self, task_id: str) -> bool:
         return self.redis_client.sismember("queued_tasks", task_id)
 
-    def requeue_cached_tasks(self):
+    def remove_cached_tasks(self):
         """
-        (Optional) Re-queue tasks that might be in 'queued_tasks' set
-        but missing in 'ml_tasks' list. Currently a placeholder.
+        Removes tasks that are in 'queued_tasks' but not in 'ml_tasks'.
         """
-        pass
+        queued_task_ids = self.redis_client.smembers("queued_tasks")
+        ml_tasks = {json.loads(task.decode("utf-8")).get("task_id") for task in self.redis_client.lrange("ml_tasks", 0, -1)}
+        for task_id in queued_task_ids:
+            task_id = task_id.decode("utf-8")
+            if task_id not in ml_tasks:
+                logger.info(f"Task {task_id} is in 'queued_tasks' but not in 'ml_tasks'. Removing.")
+                self.redis_client.srem("queued_tasks", task_id)
+
 
     def requeue_inprogress_tasks(self):
         """
