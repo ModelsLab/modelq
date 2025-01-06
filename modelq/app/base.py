@@ -13,7 +13,7 @@ import requests  # <-- NEW: To send error payloads to a webhook
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError
 from modelq.app.middleware import Middleware
-
+import os
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -33,7 +33,7 @@ class ModelQ:
         ssl_cert_reqs: Any = None,
         redis_client: Any = None,
         max_connections: int = 50,  # Limit max connections to avoid "too many clients"
-        webhook_url: Optional[str] = None,  # <-- NEW: optional webhook for error logging
+        webhook_url: Optional[str] = None,  # <-- optional webhook for error logging
         **kwargs,
     ):
         if redis_client:
@@ -51,17 +51,20 @@ class ModelQ:
                 **kwargs,
             )
         self.worker_threads = []
-        self.server_id = server_id or str(uuid.uuid4())
+        # self.server_id = server_id or str(uuid.uuid4())
+        if server_id is None:
+            # Attempt to load the server_id from a local file:
+            server_id = self._get_or_create_server_id_file()
+        self.server_id = server_id
         self.allowed_tasks = set()
         self.task_configurations: Dict[str, Dict[str, Any]] = {}
         self.middleware: Middleware = None
 
-        # NEW: Store the webhook URL
+        # Store the webhook URL
         self.webhook_url = webhook_url
 
         self.register_server()
         self.requeue_inprogress_tasks()
-        self.remove_cached_tasks()
 
     def _connect_to_redis(
         self,
@@ -81,6 +84,7 @@ class ModelQ:
             db=db,
             password=password,
             username=username,
+            # If you need TLS/SSL, uncomment:
             # ssl=ssl,
             # ssl_cert_reqs=ssl_cert_reqs,
             max_connections=max_connections,
@@ -99,10 +103,33 @@ class ModelQ:
         server_data["status"] = status
         self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
 
+    def get_registered_server_ids(self) -> list:
+        """
+        Returns a list of server_ids that are currently registered in Redis under the 'servers' hash.
+        """
+        # hkeys returns the raw bytes for each key
+        keys = self.redis_client.hkeys("servers")
+        # Decode each byte key to a UTF-8 string
+        return [k.decode("utf-8") for k in keys]
+        
+    def _get_or_create_server_id_file(self) -> str:
+        file_path = "server_id.txt"
+        if os.path.exists(file_path):
+            with open(file_path, "r") as f:
+                return f.read().strip()
+        else:
+            new_id = str(uuid.uuid4())
+            with open(file_path, "w") as f:
+                f.write(new_id)
+            return new_id
+            
     def enqueue_task(self, task_name: dict, payload: dict):
+        """
+        Pushes a task into the normal 'ml_tasks' queue immediately.
+        """
         task = {**task_name, "status": "queued"}
         task_id = task.get("task_id")
-
+        print(task)
         if not self._is_task_in_queue(task_id):
             with self.redis_client.pipeline() as pipe:
                 pipe.rpush("ml_tasks", json.dumps(task))
@@ -114,18 +141,46 @@ class ModelQ:
     def _is_task_in_queue(self, task_id: str) -> bool:
         return self.redis_client.sismember("queued_tasks", task_id)
 
-    def remove_cached_tasks(self):
+    def enqueue_delayed_task(self, task_dict: dict, delay_seconds: int):
         """
-        Removes tasks that are in 'queued_tasks' but not in 'ml_tasks'.
+        Enqueues a task into a Redis sorted set ('delayed_tasks'), to be processed after 'delay_seconds'.
         """
-        queued_task_ids = self.redis_client.smembers("queued_tasks")
-        ml_tasks = {json.loads(task.decode("utf-8")).get("task_id") for task in self.redis_client.lrange("ml_tasks", 0, -1)}
-        for task_id in queued_task_ids:
-            task_id = task_id.decode("utf-8")
-            if task_id not in ml_tasks:
-                logger.info(f"Task {task_id} is in 'queued_tasks' but not in 'ml_tasks'. Removing.")
-                self.redis_client.srem("queued_tasks", task_id)
+        run_at = time.time() + delay_seconds
+        # Convert the entire task_dict to a JSON string for storage
+        task_json = json.dumps(task_dict)
+        self.redis_client.zadd("delayed_tasks", {task_json: run_at})
+        logger.info(f"Delayed task {task_dict.get('task_id')} by {delay_seconds} seconds.")
 
+    def requeue_delayed_tasks(self):
+        """
+        Periodically checks 'delayed_tasks' for tasks whose run_at time has passed.
+        Moves them back into 'ml_tasks' for immediate processing.
+        """
+        while True:
+            now = time.time()
+            # Find tasks ready to retry (score <= now)
+            ready_tasks = self.redis_client.zrangebyscore("delayed_tasks", 0, now)
+
+            for task_json in ready_tasks:
+                # Remove from delayed_tasks
+                self.redis_client.zrem("delayed_tasks", task_json)
+
+                # Re-push onto main queue
+                self.redis_client.lpush("ml_tasks", task_json)
+                # We don't necessarily re-add to 'queued_tasks' set here because
+                # it's optional. However, you may want to add:
+                #   self.redis_client.sadd("queued_tasks", <task_id>)
+                # if you want to keep that set consistent.
+
+            # Sleep a bit to avoid busy looping
+            time.sleep(1)
+
+    def requeue_cached_tasks(self):
+        """
+        (Optional) Re-queue tasks that might be in 'queued_tasks' set
+        but missing in 'ml_tasks' list. Currently a placeholder.
+        """
+        pass
 
     def requeue_inprogress_tasks(self):
         """
@@ -188,7 +243,11 @@ class ModelQ:
                 task = task_class(task_name=task_name, payload=payload)
                 if stream:
                     task.stream = True
+
+                # Enqueue the task
                 self.enqueue_task(task.to_dict(), payload=payload)
+
+                # Keep a record of the task in Redis
                 self.redis_client.set(f"task:{task.task_id}", json.dumps(task.to_dict()))
                 return task
 
@@ -199,10 +258,20 @@ class ModelQ:
         return decorator
 
     def start_workers(self, no_of_workers: int = 1):
+        """
+        Starts worker threads that pop tasks from 'ml_tasks'.
+        Also starts a background thread (requeue_thread) to process 'delayed_tasks'.
+        """
         if any(thread.is_alive() for thread in self.worker_threads):
             return  # Workers are already running
 
         self.check_middleware("before_worker_boot")
+
+        # 1) Start the delayed re-queue thread (daemon)
+        requeue_thread = threading.Thread(target=self.requeue_delayed_tasks)
+        requeue_thread.daemon = True
+        requeue_thread.start()
+        self.worker_threads.append(requeue_thread)
 
         def worker_loop(worker_id):
             while True:
@@ -233,20 +302,28 @@ class ModelQ:
                                     f"Worker {worker_id} finished task: {task.task_name} "
                                     f"in {end_time - start_time:.2f} seconds"
                                 )
+
                             except TaskProcessingError as e:
                                 logger.error(
                                     f"Worker {worker_id} encountered a TaskProcessingError: {e}"
                                 )
+                                # Instead of immediately re-enqueuing, we delay it if retries remain
                                 if task.payload.get("retries", 0) > 0:
-                                    task.payload["retries"] -= 1
-                                    self.enqueue_task(task.to_dict(), payload=task.payload)
+                                    new_task_dict = task.to_dict()
+                                    new_task_dict["payload"] = task.original_payload
+                                    new_task_dict["payload"]["retries"] -= 1
+                                    self.enqueue_delayed_task(new_task_dict, delay_seconds=30)
+
                             except Exception as e:
                                 logger.error(
                                     f"Worker {worker_id} encountered an unexpected error: {e}"
                                 )
+                                # Delay re-enqueue if retries remain
                                 if task.payload.get("retries", 0) > 0:
-                                    task.payload["retries"] -= 1
-                                    self.enqueue_task(task.to_dict(), payload=task.payload)
+                                    new_task_dict = task.to_dict()
+                                    new_task_dict["payload"] = task.original_payload
+                                    new_task_dict["payload"]["retries"] -= 1
+                                    self.enqueue_delayed_task(new_task_dict, delay_seconds=30)
                         else:
                             with self.redis_client.pipeline() as pipe:
                                 pipe.rpush("ml_tasks", task_json)
@@ -287,7 +364,7 @@ class ModelQ:
           - Full traceback
           - Timestamp
         """
-        error_trace = traceback.format_exc()  # captures the full traceback
+        error_trace = traceback.format_exc()
         log_data = {
             "task_id": task.task_id,
             "task_name": task.task_name,
@@ -304,17 +381,16 @@ class ModelQ:
 
     def post_error_to_webhook(self, task: Task, exc: Exception):
         """
-        Non-blocking version that constructs the entire Discord message (content),
+        Non-blocking method that constructs the entire message (content),
         then spawns a thread to do the POST request.
         """
         if not self.webhook_url:
-            return  # No webhook configured, do nothing
-    
-        # Capture the full traceback from the current exception context
+            return  # No webhook configured
+
+        # Capture the full traceback
         full_tb = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
-    
         payload_str = json.dumps(task.payload, indent=2)  # pretty-print the payload
-    
+
         content_str = (
             f"**Task Name**: {task.task_name}\n"
             f"**Task ID**: {task.task_id}\n"
@@ -322,19 +398,15 @@ class ModelQ:
             f"**Error Message**: {exc}\n"
             f"**Traceback**:\n```{full_tb}```"
         )
-    
-        # Now we have the entire message. Let's pass it to a thread.
+
         t = threading.Thread(
             target=self._post_error_to_webhook_sync,
             args=(content_str,),
             daemon=True
         )
         t.start()
-    
+
     def _post_error_to_webhook_sync(self, content_str: str):
-        """
-        Sends the message to Discord in blocking fashion. Called by a background thread.
-        """
         payload = {"content": content_str}
         try:
             resp = requests.post(self.webhook_url, json=payload, timeout=10)
@@ -345,7 +417,6 @@ class ModelQ:
                 )
         except Exception as e2:
             logger.error(f"Exception while sending error to webhook: {e2}")
-
 
     def process_task(self, task: Task) -> None:
         """
@@ -457,6 +528,10 @@ class ModelQ:
             self.redis_client.srem("processing_tasks", task.task_id)
 
     def _run_with_timeout(self, func, timeout, *args, **kwargs):
+        """
+        Runs the given function with a threading-based timeout.
+        If the thread is still alive after `timeout` seconds, raises TaskTimeoutError.
+        """
         result = [None]
         exception = [None]
 

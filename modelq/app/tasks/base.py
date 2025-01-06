@@ -7,6 +7,7 @@ from typing import Any, Optional, Generator
 from modelq.exceptions import TaskTimeoutError, TaskProcessingError
 from PIL import Image, PngImagePlugin
 import io
+import copy
 
 
 class Task:
@@ -15,6 +16,7 @@ class Task:
         self.task_id = str(uuid.uuid4())
         self.task_name = task_name
         self.payload = payload
+        self.original_payload = copy.deepcopy(payload)
         self.status = "queued"
         self.result = None
         self.timestamp = time.time()
