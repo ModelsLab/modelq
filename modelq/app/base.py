@@ -51,7 +51,6 @@ class ModelQ:
                 **kwargs,
             )
         self.worker_threads = []
-        # self.server_id = server_id or str(uuid.uuid4())
         if server_id is None:
             # Attempt to load the server_id from a local file:
             server_id = self._get_or_create_server_id_file()
@@ -107,9 +106,7 @@ class ModelQ:
         """
         Returns a list of server_ids that are currently registered in Redis under the 'servers' hash.
         """
-        # hkeys returns the raw bytes for each key
-        keys = self.redis_client.hkeys("servers")
-        # Decode each byte key to a UTF-8 string
+        keys = self.redis_client.hkeys("servers")  # returns raw bytes for each key
         return [k.decode("utf-8") for k in keys]
         
     def _get_or_create_server_id_file(self) -> str:
@@ -129,7 +126,6 @@ class ModelQ:
         """
         task = {**task_name, "status": "queued"}
         task_id = task.get("task_id")
-        print(task)
         if not self._is_task_in_queue(task_id):
             with self.redis_client.pipeline() as pipe:
                 pipe.rpush("ml_tasks", json.dumps(task))
@@ -172,7 +168,6 @@ class ModelQ:
                 #   self.redis_client.sadd("queued_tasks", <task_id>)
                 # if you want to keep that set consistent.
 
-            # Sleep a bit to avoid busy looping
             time.sleep(1)
 
     def requeue_cached_tasks(self):
@@ -203,7 +198,58 @@ class ModelQ:
                 self.redis_client.sadd("queued_tasks", task_id)
                 self.redis_client.srem("processing_tasks", task_id)
 
+    #
+    # --- NEW METHOD: cleanup_queued_tasks ---
+    #
+    def cleanup_queued_tasks(self):
+        """
+        Cleans up any task_ids which exist in 'queued_tasks' set but
+        are NOT present in the 'ml_tasks' list.
+        """
+        try:
+            # 1) Get all tasks currently in the 'ml_tasks' list
+            ml_tasks_list = self.redis_client.lrange("ml_tasks", 0, -1)
+            ml_task_ids = set()
+
+            for t_json in ml_tasks_list:
+                try:
+                    t_dict = json.loads(t_json)
+                    task_id_in_list = t_dict.get("task_id")
+                    if task_id_in_list:
+                        ml_task_ids.add(task_id_in_list)
+                except Exception as parse_err:
+                    logger.error(f"Failed to parse a JSON task from ml_tasks: {parse_err}")
+
+            # 2) Get all queued task IDs
+            queued_task_ids = self.redis_client.smembers("queued_tasks")
+            if not queued_task_ids:
+                return  # nothing to clean up
+
+            # 3) For each queued ID, if it's NOT in ml_task_ids, remove it from queued_tasks
+            removed_count = 0
+            for qid_bytes in queued_task_ids:
+                qid = qid_bytes.decode("utf-8")
+                if qid not in ml_task_ids:
+                    self.redis_client.srem("queued_tasks", qid)
+                    removed_count += 1
+
+            if removed_count > 0:
+                logger.info(
+                    f"Removed {removed_count} stale task IDs from 'queued_tasks' that weren't in 'ml_tasks'."
+                )
+        except Exception as e:
+            logger.error(f"Exception in cleanup_queued_tasks: {e}")
+
     def get_all_queued_tasks(self) -> list:
+        """
+        Returns a list of tasks that are marked as 'queued'.
+        Also spawns a thread to clean up any stale task IDs that might
+        be in 'queued_tasks' but missing in 'ml_tasks'.
+        """
+        # --- Start cleanup in a background thread ---
+        cleanup_thread = threading.Thread(target=self.cleanup_queued_tasks, daemon=True)
+        cleanup_thread.start()
+
         queued_task_ids = self.redis_client.smembers("queued_tasks")
         queued_tasks = []
         if queued_task_ids:
@@ -211,11 +257,13 @@ class ModelQ:
                 for t_id in queued_task_ids:
                     pipe.get(f"task:{t_id.decode('utf-8')}")
                 results = pipe.execute()
+
             for res in results:
                 if res:
                     task_data = json.loads(res)
                     if task_data.get("status") == "queued":
                         queued_tasks.append(task_data)
+
         return queued_tasks
 
     def is_task_processing_or_executed(self, task_id: str) -> bool:
@@ -268,8 +316,7 @@ class ModelQ:
         self.check_middleware("before_worker_boot")
 
         # 1) Start the delayed re-queue thread (daemon)
-        requeue_thread = threading.Thread(target=self.requeue_delayed_tasks)
-        requeue_thread.daemon = True
+        requeue_thread = threading.Thread(target=self.requeue_delayed_tasks, daemon=True)
         requeue_thread.start()
         self.worker_threads.append(requeue_thread)
 
@@ -307,7 +354,6 @@ class ModelQ:
                                 logger.error(
                                     f"Worker {worker_id} encountered a TaskProcessingError: {e}"
                                 )
-                                # Instead of immediately re-enqueuing, we delay it if retries remain
                                 if task.payload.get("retries", 0) > 0:
                                     new_task_dict = task.to_dict()
                                     new_task_dict["payload"] = task.original_payload
@@ -318,7 +364,6 @@ class ModelQ:
                                 logger.error(
                                     f"Worker {worker_id} encountered an unexpected error: {e}"
                                 )
-                                # Delay re-enqueue if retries remain
                                 if task.payload.get("retries", 0) > 0:
                                     new_task_dict = task.to_dict()
                                     new_task_dict["payload"] = task.original_payload
@@ -335,8 +380,7 @@ class ModelQ:
                     )
 
         for i in range(no_of_workers):
-            worker_thread = threading.Thread(target=worker_loop, args=(i,))
-            worker_thread.daemon = True
+            worker_thread = threading.Thread(target=worker_loop, args=(i,), daemon=True)
             worker_thread.start()
             self.worker_threads.append(worker_thread)
 
@@ -356,13 +400,6 @@ class ModelQ:
     def log_task_error_to_file(self, task: Task, exc: Exception, file_path="modelq_errors.log"):
         """
         Logs detailed error info to a specified file, with dashes before and after.
-        Includes:
-          - Task ID
-          - Task name
-          - Task payload
-          - Error message
-          - Full traceback
-          - Timestamp
         """
         error_trace = traceback.format_exc()
         log_data = {
