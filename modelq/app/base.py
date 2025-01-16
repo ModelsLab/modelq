@@ -242,29 +242,29 @@ class ModelQ:
 
     def get_all_queued_tasks(self) -> list:
         """
-        Returns a list of tasks that are marked as 'queued'.
-        Also spawns a thread to clean up any stale task IDs that might
-        be in 'queued_tasks' but missing in 'ml_tasks'.
+        Returns a list of tasks that are currently in the 'ml_tasks' list with a status of 'queued'.
+        Also spawns a thread to clean up any stale tasks if needed.
         """
-        # --- Start cleanup in a background thread ---
+        # --- (Optional) Start a cleanup thread if you still want it ---
         cleanup_thread = threading.Thread(target=self.cleanup_queued_tasks, daemon=True)
         cleanup_thread.start()
-
-        queued_task_ids = self.redis_client.smembers("queued_tasks")
+    
         queued_tasks = []
-        if queued_task_ids:
-            with self.redis_client.pipeline() as pipe:
-                for t_id in queued_task_ids:
-                    pipe.get(f"task:{t_id.decode('utf-8')}")
-                results = pipe.execute()
-
-            for res in results:
-                if res:
-                    task_data = json.loads(res)
-                    if task_data.get("status") == "queued":
-                        queued_tasks.append(task_data)
-
+        # 1) Fetch all tasks from the 'ml_tasks' list
+        tasks_in_list = self.redis_client.lrange("ml_tasks", 0, -1)
+    
+        # 2) Parse each JSON-encoded task in the queue
+        for t_json in tasks_in_list:
+            try:
+                t_dict = json.loads(t_json)
+                # 3) Check if the task's status is 'queued'
+                if t_dict.get("status") == "queued":
+                    queued_tasks.append(t_dict)
+            except Exception as e:
+                logger.error(f"Error deserializing task from ml_tasks: {e}")
+    
         return queued_tasks
+
 
     def is_task_processing_or_executed(self, task_id: str) -> bool:
         task_status = self.get_task_status(task_id)
