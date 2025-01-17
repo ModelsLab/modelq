@@ -14,6 +14,7 @@ from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError
 from modelq.app.middleware import Middleware
 import os
+
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
 )
@@ -21,6 +22,11 @@ logger = logging.getLogger(__name__)
 
 
 class ModelQ:
+    # Constants for heartbeat and pruning intervals
+    HEARTBEAT_INTERVAL = 30     # seconds: how often this server updates its heartbeat
+    PRUNE_TIMEOUT = 300         # seconds: how long before a server is considered stale
+    PRUNE_CHECK_INTERVAL = 60   # seconds: how often to check for stale servers
+
     def __init__(
         self,
         host: str = "localhost",
@@ -62,8 +68,10 @@ class ModelQ:
         # Store the webhook URL
         self.webhook_url = webhook_url
 
+        # Register server (with initial heartbeat)
         self.register_server()
-        self.requeue_inprogress_tasks()
+        # # Re-queue tasks that were in progress if needed
+        # self.requeue_inprogress_tasks()
 
     def _connect_to_redis(
         self,
@@ -91,15 +99,69 @@ class ModelQ:
         return redis.Redis(connection_pool=pool)
 
     def register_server(self):
-        self.redis_client.hset(
-            "servers",
-            self.server_id,
-            json.dumps({"allowed_tasks": list(self.allowed_tasks), "status": "idle"}),
-        )
+        """
+        Registers this server in the 'servers' hash, including allowed tasks,
+        current status, and last_heartbeat timestamp.
+        """
+        server_data = {
+            "allowed_tasks": list(self.allowed_tasks),
+            "status": "idle",
+            "last_heartbeat": time.time(),  # <-- store current timestamp
+        }
+        self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
+
+    def heartbeat(self):
+        """
+        Periodically called to update this server's 'last_heartbeat' in Redis.
+        """
+        raw_data = self.redis_client.hget("servers", self.server_id)
+        if not raw_data:
+            # If somehow not found, re-register
+            self.register_server()
+            return
+
+        data = json.loads(raw_data)
+        data["last_heartbeat"] = time.time()
+        self.redis_client.hset("servers", self.server_id, json.dumps(data))
+
+    def prune_inactive_servers(self, timeout_seconds: int = None):
+        """
+        Removes servers from the 'servers' hash if they haven't sent
+        a heartbeat within 'timeout_seconds' seconds.
+        """
+        if timeout_seconds is None:
+            timeout_seconds = self.PRUNE_TIMEOUT
+
+        all_servers = self.redis_client.hgetall("servers")
+        now = time.time()
+        removed_count = 0
+
+        for server_id_bytes, data_bytes in all_servers.items():
+            server_id_str = server_id_bytes.decode("utf-8")
+            try:
+                data = json.loads(data_bytes.decode("utf-8"))
+                last_heartbeat = data.get("last_heartbeat", 0)
+                if (now - last_heartbeat) > timeout_seconds:
+                    # This server is stale; remove it
+                    self.redis_client.hdel("servers", server_id_str)
+                    removed_count += 1
+                    logger.info(f"[Prune] Removed stale server: {server_id_str}")
+            except Exception as e:
+                logger.warning(f"[Prune] Could not parse server data for {server_id_str}: {e}")
+
+        if removed_count > 0:
+            logger.info(f"[Prune] Total {removed_count} inactive servers pruned.")
 
     def update_server_status(self, status: str):
-        server_data = json.loads(self.redis_client.hget("servers", self.server_id))
+        raw_data = self.redis_client.hget("servers", self.server_id)
+        if not raw_data:
+            # If for some reason it's missing, re-register
+            self.register_server()
+            return
+        server_data = json.loads(raw_data)
         server_data["status"] = status
+        # Also update last_heartbeat whenever status changes
+        server_data["last_heartbeat"] = time.time()
         self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
 
     def get_registered_server_ids(self) -> list:
@@ -108,7 +170,7 @@ class ModelQ:
         """
         keys = self.redis_client.hkeys("servers")  # returns raw bytes for each key
         return [k.decode("utf-8") for k in keys]
-        
+
     def _get_or_create_server_id_file(self) -> str:
         file_path = "server_id.txt"
         if os.path.exists(file_path):
@@ -119,7 +181,7 @@ class ModelQ:
             with open(file_path, "w") as f:
                 f.write(new_id)
             return new_id
-            
+
     def enqueue_task(self, task_name: dict, payload: dict):
         """
         Pushes a task into the normal 'ml_tasks' queue immediately.
@@ -139,10 +201,10 @@ class ModelQ:
 
     def enqueue_delayed_task(self, task_dict: dict, delay_seconds: int):
         """
-        Enqueues a task into a Redis sorted set ('delayed_tasks'), to be processed after 'delay_seconds'.
+        Enqueues a task into a Redis sorted set ('delayed_tasks'), 
+        to be processed after 'delay_seconds'.
         """
         run_at = time.time() + delay_seconds
-        # Convert the entire task_dict to a JSON string for storage
         task_json = json.dumps(task_dict)
         self.redis_client.zadd("delayed_tasks", {task_json: run_at})
         logger.info(f"Delayed task {task_dict.get('task_id')} by {delay_seconds} seconds.")
@@ -154,19 +216,11 @@ class ModelQ:
         """
         while True:
             now = time.time()
-            # Find tasks ready to retry (score <= now)
             ready_tasks = self.redis_client.zrangebyscore("delayed_tasks", 0, now)
 
             for task_json in ready_tasks:
-                # Remove from delayed_tasks
                 self.redis_client.zrem("delayed_tasks", task_json)
-
-                # Re-push onto main queue
                 self.redis_client.lpush("ml_tasks", task_json)
-                # We don't necessarily re-add to 'queued_tasks' set here because
-                # it's optional. However, you may want to add:
-                #   self.redis_client.sadd("queued_tasks", <task_id>)
-                # if you want to keep that set consistent.
 
             time.sleep(1)
 
@@ -198,16 +252,12 @@ class ModelQ:
                 self.redis_client.sadd("queued_tasks", task_id)
                 self.redis_client.srem("processing_tasks", task_id)
 
-    #
-    # --- NEW METHOD: cleanup_queued_tasks ---
-    #
     def cleanup_queued_tasks(self):
         """
         Cleans up any task_ids which exist in 'queued_tasks' set but
         are NOT present in the 'ml_tasks' list.
         """
         try:
-            # 1) Get all tasks currently in the 'ml_tasks' list
             ml_tasks_list = self.redis_client.lrange("ml_tasks", 0, -1)
             ml_task_ids = set()
 
@@ -220,12 +270,10 @@ class ModelQ:
                 except Exception as parse_err:
                     logger.error(f"Failed to parse a JSON task from ml_tasks: {parse_err}")
 
-            # 2) Get all queued task IDs
             queued_task_ids = self.redis_client.smembers("queued_tasks")
             if not queued_task_ids:
-                return  # nothing to clean up
+                return
 
-            # 3) For each queued ID, if it's NOT in ml_task_ids, remove it from queued_tasks
             removed_count = 0
             for qid_bytes in queued_task_ids:
                 qid = qid_bytes.decode("utf-8")
@@ -245,26 +293,21 @@ class ModelQ:
         Returns a list of tasks that are currently in the 'ml_tasks' list with a status of 'queued'.
         Also spawns a thread to clean up any stale tasks if needed.
         """
-        # --- (Optional) Start a cleanup thread if you still want it ---
         cleanup_thread = threading.Thread(target=self.cleanup_queued_tasks, daemon=True)
         cleanup_thread.start()
-    
+
         queued_tasks = []
-        # 1) Fetch all tasks from the 'ml_tasks' list
         tasks_in_list = self.redis_client.lrange("ml_tasks", 0, -1)
-    
-        # 2) Parse each JSON-encoded task in the queue
+
         for t_json in tasks_in_list:
             try:
                 t_dict = json.loads(t_json)
-                # 3) Check if the task's status is 'queued'
                 if t_dict.get("status") == "queued":
                     queued_tasks.append(t_dict)
             except Exception as e:
                 logger.error(f"Error deserializing task from ml_tasks: {e}")
-    
-        return queued_tasks
 
+        return queued_tasks
 
     def is_task_processing_or_executed(self, task_id: str) -> bool:
         task_status = self.get_task_status(task_id)
@@ -308,18 +351,32 @@ class ModelQ:
     def start_workers(self, no_of_workers: int = 1):
         """
         Starts worker threads that pop tasks from 'ml_tasks'.
-        Also starts a background thread (requeue_thread) to process 'delayed_tasks'.
+        Also starts background threads:
+          - Delayed re-queue thread
+          - Heartbeat thread
+          - Pruning thread
         """
         if any(thread.is_alive() for thread in self.worker_threads):
             return  # Workers are already running
 
         self.check_middleware("before_worker_boot")
 
-        # 1) Start the delayed re-queue thread (daemon)
+        # 1) Start the delayed re-queue thread
         requeue_thread = threading.Thread(target=self.requeue_delayed_tasks, daemon=True)
         requeue_thread.start()
         self.worker_threads.append(requeue_thread)
 
+        # 2) Start a heartbeat thread
+        heartbeat_thread = threading.Thread(target=self._heartbeat_loop, daemon=True)
+        heartbeat_thread.start()
+        self.worker_threads.append(heartbeat_thread)
+
+        # 3) Start a pruning thread
+        pruning_thread = threading.Thread(target=self._pruning_loop, daemon=True)
+        pruning_thread.start()
+        self.worker_threads.append(pruning_thread)
+
+        # 4) Worker threads to process tasks
         def worker_loop(worker_id):
             while True:
                 try:
@@ -391,6 +448,22 @@ class ModelQ:
             f"{self.redis_client.connection_pool.connection_kwargs['port']}. "
             f"Registered tasks: {task_names}"
         )
+
+    def _heartbeat_loop(self):
+        """
+        Continuously updates the heartbeat for this server.
+        """
+        while True:
+            self.heartbeat()
+            time.sleep(self.HEARTBEAT_INTERVAL)
+
+    def _pruning_loop(self):
+        """
+        Continuously prunes servers that have not updated their heartbeat in a while.
+        """
+        while True:
+            self.prune_inactive_servers(timeout_seconds=self.PRUNE_TIMEOUT)
+            time.sleep(self.PRUNE_CHECK_INTERVAL)
 
     def check_middleware(self, middleware_event: str):
         logger.info(f"Middleware event triggered: {middleware_event}")
