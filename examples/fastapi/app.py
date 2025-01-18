@@ -5,6 +5,7 @@ from PIL import Image
 import io
 import time
 from modelq.app.utils import base64_to_image
+import random
 
 app = FastAPI()
 
@@ -43,6 +44,9 @@ async def image_app():
 
 @app.get("/add")
 async def add():
-    task = add_task()
-    modelq.get_all_queued_tasks()
+    params = {
+        "int" : random.random()
+    }
+    task = add_task(params)
+    # modelq.get_all_queued_tasks()
     return str(task.get_result(modelq.redis_client))

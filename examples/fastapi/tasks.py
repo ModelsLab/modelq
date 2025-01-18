@@ -33,9 +33,9 @@ def stream(params):
         yield new_text
 
 
-@modelq.task(timeout=15)
+@modelq.task()
 def add_task():
-    time.sleep(1)
+    time.sleep(20)
     return 2 + 3
 
 
