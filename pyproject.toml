@@ -1,6 +1,6 @@
 [tool.poetry]
 name = "modelq"
-version = "0.1.17"
+version = "0.1.18"
 description = "Celery-like task queue for ML inference."
 authors = ["Tanmaypatil123 <tanmay@modelslab.com>"]
 readme = "README.md"

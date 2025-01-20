@@ -137,22 +137,23 @@ class ModelQ:
 
             task_dict = json.loads(task_data)
             started_at = task_dict.get("started_at", 0)
-            if now - started_at > threshold:
-                logger.info(
-                    f"Re-queuing stuck task {task_id} which has been 'processing' for {now - started_at:.2f} seconds."
-                )
-                # Update status, queued_at, etc.
-                task_dict["status"] = "queued"
-                task_dict["queued_at"] = now
-
-                # Store the updated dict back in Redis
-                self.redis_client.set(f"task:{task_id}", json.dumps(task_dict))
-                
-                # Push it back into ml_tasks
-                self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
-
-                # Remove from processing set
-                self.redis_client.srem("processing_tasks", task_id)
+            if started_at:
+                if now - started_at > threshold:
+                    logger.info(
+                        f"Re-queuing stuck task {task_id} which has been 'processing' for {now - started_at:.2f} seconds."
+                    )
+                    # Update status, queued_at, etc.
+                    task_dict["status"] = "queued"
+                    task_dict["queued_at"] = now
+    
+                    # Store the updated dict back in Redis
+                    self.redis_client.set(f"task:{task_id}", json.dumps(task_dict))
+                    
+                    # Push it back into ml_tasks
+                    self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
+    
+                    # Remove from processing set
+                    self.redis_client.srem("processing_tasks", task_id)
                 
     def update_server_status(self, status: str):
         """
