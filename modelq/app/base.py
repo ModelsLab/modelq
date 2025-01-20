@@ -117,6 +117,43 @@ class ModelQ:
         }
         self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
 
+    def requeue_stuck_processing_tasks(self, threshold: float = 180.0):
+        """
+        Re-queues any tasks that have been in 'processing' for more than 'threshold' seconds.
+        """
+        processing_task_ids = self.redis_client.smembers("processing_tasks")
+        now = time.time()
+
+        for pid in processing_task_ids:
+            task_id = pid.decode("utf-8")
+            task_data = self.redis_client.get(f"task:{task_id}")
+            if not task_data:
+                # If there's no data in Redis for that task, remove it from processing set.
+                self.redis_client.srem("processing_tasks", task_id)
+                logger.warning(
+                    f"No record found for in-progress task {task_id}. Removing from 'processing_tasks'."
+                )
+                continue
+
+            task_dict = json.loads(task_data)
+            started_at = task_dict.get("started_at", 0)
+            if now - started_at > threshold:
+                logger.info(
+                    f"Re-queuing stuck task {task_id} which has been 'processing' for {now - started_at:.2f} seconds."
+                )
+                # Update status, queued_at, etc.
+                task_dict["status"] = "queued"
+                task_dict["queued_at"] = now
+
+                # Store the updated dict back in Redis
+                self.redis_client.set(f"task:{task_id}", json.dumps(task_dict))
+                
+                # Push it back into ml_tasks
+                self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
+
+                # Remove from processing set
+                self.redis_client.srem("processing_tasks", task_id)
+                
     def update_server_status(self, status: str):
         """
         Updates the server's status in Redis.
@@ -421,6 +458,7 @@ class ModelQ:
         """
         while True:
             self.prune_inactive_servers(timeout_seconds=self.PRUNE_TIMEOUT)
+            self.requeue_stuck_processing_tasks(threshold=180)
             time.sleep(self.PRUNE_CHECK_INTERVAL)
 
     def check_middleware(self, middleware_event: str):
