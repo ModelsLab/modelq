@@ -269,6 +269,7 @@ class ModelQ:
             task_dict = json.loads(task_data)
             if task_dict.get("status") == "processing":
                 logger.info(f"Re-queuing task {task_id} which was in progress.")
+                task_dict["payload"] = task_dict.original_payload
                 self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
                 self.redis_client.srem("processing_tasks", task_id)
 
