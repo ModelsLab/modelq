@@ -7,6 +7,7 @@ import uuid
 import logging
 import traceback
 from typing import Optional, Dict, Any
+import socket
 
 import requests  # For sending error payloads to a webhook
 
@@ -26,6 +27,7 @@ class ModelQ:
     HEARTBEAT_INTERVAL = 30     # seconds: how often this server updates its heartbeat
     PRUNE_TIMEOUT = 300         # seconds: how long before a server is considered stale
     PRUNE_CHECK_INTERVAL = 60   # seconds: how often to check for stale servers
+    TASK_RESULT_RETENTION = 86400
 
     def __init__(
         self,
@@ -95,15 +97,7 @@ class ModelQ:
         return redis.Redis(connection_pool=pool)
 
     def _get_or_create_server_id_file(self) -> str:
-        file_path = "server_id.txt"
-        if os.path.exists(file_path):
-            with open(file_path, "r") as f:
-                return f.read().strip()
-        else:
-            new_id = str(uuid.uuid4())
-            with open(file_path, "w") as f:
-                f.write(new_id)
-            return new_id
+        return str(socket.gethostname())
 
     def register_server(self):
         """
@@ -154,7 +148,46 @@ class ModelQ:
     
                     # Remove from processing set
                     self.redis_client.srem("processing_tasks", task_id)
-                
+
+    def prune_old_task_results(self, older_than_seconds: int = None):
+        """
+        Deletes task result keys (stored with the prefix 'task_result:') whose
+        finished_at (or started_at if finished_at is not available) timestamp is older
+        than `older_than_seconds`. In addition, it also removes the corresponding
+        task key (stored with the prefix 'task:').
+        """
+        if older_than_seconds is None:
+            older_than_seconds = self.TASK_RESULT_RETENTION
+
+        now = time.time()
+        keys_deleted = 0
+
+        # Use scan_iter to avoid blocking Redis
+        for key in self.redis_client.scan_iter("task_result:*"):
+            try:
+                task_json = self.redis_client.get(key)
+                if not task_json:
+                    continue
+                task_data = json.loads(task_json)
+                # Use finished_at if available; otherwise fallback to started_at
+                timestamp = task_data.get("finished_at") or task_data.get("started_at")
+                if timestamp and (now - timestamp > older_than_seconds):
+                    # Delete the task_result key
+                    self.redis_client.delete(key)
+                    # Extract the task id from the key and delete the corresponding task key.
+                    key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                    task_id = key_str.split("task_result:")[-1]
+                    task_key = f"task:{task_id}"
+                    self.redis_client.delete(task_key)
+                    keys_deleted += 1
+                    logger.info(f"Deleted old keys: {key_str} and {task_key}")
+            except Exception as e:
+                key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                logger.error(f"Error processing key {key_str}: {e}")
+
+        if keys_deleted:
+            logger.info(f"Pruned {keys_deleted} task(s) older than {older_than_seconds} seconds.")
+            
     def update_server_status(self, status: str):
         """
         Updates the server's status in Redis.
@@ -382,7 +415,12 @@ class ModelQ:
                     task = Task.from_dict(task_dict)
 
                     # Mark task as 'processing'
-                    self.redis_client.sadd("processing_tasks", task.task_id)
+                    added = self.redis_client.sadd("processing_tasks", task.task_id)
+                    if added == 0:
+                        logger.warning(
+                            f"Task {task.task_id} is already being processed. Skipping duplicate."
+                        )
+                        continue
                     task.status = "processing"
 
                     # Set started_at
@@ -461,6 +499,7 @@ class ModelQ:
         while True:
             self.prune_inactive_servers(timeout_seconds=self.PRUNE_TIMEOUT)
             self.requeue_stuck_processing_tasks(threshold=180)
+            self.prune_old_task_results(older_than_seconds=self.TASK_RESULT_RETENTION)
             time.sleep(self.PRUNE_CHECK_INTERVAL)
 
     def check_middleware(self, middleware_event: str):
