@@ -42,6 +42,7 @@ class ModelQ:
         redis_client: Any = None,
         max_connections: int = 50,  # Limit max connections to avoid "too many clients"
         webhook_url: Optional[str] = None,  # Optional webhook for error logging
+        requeue_threshold : Optional[int] = None ,
         **kwargs,
     ):
         if redis_client:
@@ -67,6 +68,7 @@ class ModelQ:
         self.allowed_tasks = set()
         self.middleware: Middleware = None
         self.webhook_url = webhook_url
+        self.requeue_threshold = requeue_threshold
 
         # Register this server in Redis (with an initial heartbeat)
         self.register_server()
@@ -115,6 +117,10 @@ class ModelQ:
         """
         Re-queues any tasks that have been in 'processing' for more than 'threshold' seconds.
         """
+
+        if self.requeue_threshold :
+            threshold = self.requeue_threshold
+
         processing_task_ids = self.redis_client.smembers("processing_tasks")
         now = time.time()
 
