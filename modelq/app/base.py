@@ -43,6 +43,7 @@ class ModelQ:
         max_connections: int = 50,  # Limit max connections to avoid "too many clients"
         webhook_url: Optional[str] = None,  # Optional webhook for error logging
         requeue_threshold : Optional[int] = None ,
+        delay_seconds: int = 30,
         **kwargs,
     ):
         if redis_client:
@@ -69,6 +70,7 @@ class ModelQ:
         self.middleware: Middleware = None
         self.webhook_url = webhook_url
         self.requeue_threshold = requeue_threshold
+        self.delay_seconds = delay_seconds
 
         # Register this server in Redis (with an initial heartbeat)
         self.register_server()
@@ -454,7 +456,7 @@ class ModelQ:
                                 new_task_dict = task.to_dict()
                                 new_task_dict["payload"] = task.original_payload
                                 new_task_dict["payload"]["retries"] -= 1
-                                self.enqueue_delayed_task(new_task_dict, delay_seconds=30)
+                                self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
 
                         except Exception as e:
                             logger.error(
@@ -464,7 +466,7 @@ class ModelQ:
                                 new_task_dict = task.to_dict()
                                 new_task_dict["payload"] = task.original_payload
                                 new_task_dict["payload"]["retries"] -= 1
-                                self.enqueue_delayed_task(new_task_dict, delay_seconds=30)
+                                self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
                     else:
                         # If task is not allowed on this server, re-queue it
                         logger.warning(
