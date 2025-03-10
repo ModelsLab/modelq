@@ -271,6 +271,9 @@ class ModelQ:
         self.redis_client.rpush("ml_tasks", json.dumps(task_data))
         self.redis_client.zadd("queued_requests", {task_data["task_id"]: task_data["queued_at"]})
 
+    def delete_queue(self):
+        self.redis_client.ltrim("ml_tasks", 1, 0)
+        
     def enqueue_delayed_task(self, task_dict: dict, delay_seconds: int):
         """
         Enqueues a task into a Redis sorted set ('delayed_tasks') to be processed later.
