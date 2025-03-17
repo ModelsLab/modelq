@@ -149,7 +149,7 @@ class ModelQ:
                     task_dict["queued_at"] = now
     
                     # Store the updated dict back in Redis
-                    self.redis_client.set(f"task:{task_id}", json.dumps(task_dict))
+                    self.redis_client.set(f"task:{task_id}", json.dumps(task_dict),ex=86400)
                     
                     # Push it back into ml_tasks
                     self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
@@ -373,7 +373,7 @@ class ModelQ:
                 self.enqueue_task(task_dict, payload=payload)
 
                 # Keep a record of the task in Redis
-                self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict))
+                self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict),ex=86400)
                 return task
 
             setattr(self, func.__name__, func)
@@ -438,7 +438,7 @@ class ModelQ:
                     task_dict["started_at"] = time.time()
 
                     # Update in Redis
-                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict))
+                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict),ex=86400)
 
                     if task.task_name in self.allowed_tasks:
                         try:
@@ -622,7 +622,8 @@ class ModelQ:
         )
         self.redis_client.set(
             f"task:{task.task_id}",
-            json.dumps(task_dict)
+            json.dumps(task_dict),
+            ex=86400
         )
 
         
