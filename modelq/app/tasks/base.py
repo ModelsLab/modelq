@@ -126,7 +126,7 @@ class Task:
                 for _, messages in results:
                     for message_id, message_data in messages:
                         # print(message_data)
-                        result = json.loads(message_data["result"])
+                        result = json.loads(message_data[b"result"].decode("utf-8"))
                         yield result
                         last_id = message_id
                         # Append to combined_result
