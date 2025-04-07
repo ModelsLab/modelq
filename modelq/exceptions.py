@@ -13,3 +13,10 @@ class TaskProcessingError(Exception):
         super().__init__(f"Error processing task {task_name}: {message}")
         self.task_name = task_name
         self.message = message
+
+
+class RetryTaskException(Exception):
+    """
+    Exception to be raised within a task function to manually trigger a retry.
+    """
+    pass

@@ -12,7 +12,7 @@ import socket
 import requests  # For sending error payloads to a webhook
 
 from modelq.app.tasks import Task
-from modelq.exceptions import TaskProcessingError, TaskTimeoutError
+from modelq.exceptions import TaskProcessingError, TaskTimeoutError,RetryTaskException
 from modelq.app.middleware import Middleware
 import os
 
@@ -264,12 +264,14 @@ class ModelQ:
         """
         # Ensure status is 'queued'
         task_data["status"] = "queued"
+        self.check_middleware("before_enqueue")
         # If the decorator didn’t set queued_at, set it now
         if "queued_at" not in task_data:
             task_data["queued_at"] = time.time()
 
         self.redis_client.rpush("ml_tasks", json.dumps(task_data))
         self.redis_client.zadd("queued_requests", {task_data["task_id"]: task_data["queued_at"]})
+        self.check_middleware("after_enqueue")
 
     def delete_queue(self):
         self.redis_client.ltrim("ml_tasks", 1, 0)
@@ -413,6 +415,7 @@ class ModelQ:
 
         # 4) Worker threads
         def worker_loop(worker_id):
+            self.check_middleware("after_worker_boot")
             while True:
                 try:
                     self.update_server_status(f"worker_{worker_id}: idle")
@@ -481,6 +484,9 @@ class ModelQ:
                     logger.error(
                         f"Worker {worker_id} crashed with error: {e}. Restarting worker..."
                     )
+                finally:
+                    self.check_middleware("before_worker_shutdown")
+                    self.check_middleware("after_worker_shutdown")
 
         for i in range(no_of_workers):
             worker_thread = threading.Thread(target=worker_loop, args=(i,), daemon=True)
@@ -517,7 +523,6 @@ class ModelQ:
         """
         Hooks into the Middleware lifecycle if a Middleware instance is attached.
         """
-        logger.info(f"Middleware event triggered: {middleware_event}")
         if self.middleware:
             self.middleware.execute(event=middleware_event)
 
@@ -588,7 +593,11 @@ class ModelQ:
                 self._store_final_task_state(task, success=True)
 
             logger.info(f"Task {task.task_name} completed successfully.")
-
+        except RetryTaskException as e:
+            logger.warning(f"Task {task.task_name} requested retry: {e}")
+            new_task_dict = task.to_dict()
+            new_task_dict["payload"] = task.original_payload
+            self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
         except Exception as e:
             # Mark as failed
             task.status = "failed"
@@ -597,6 +606,7 @@ class ModelQ:
 
             # 1) Log to file
             self.log_task_error_to_file(task, e)
+            self.check_middleware("on_error", task=task, error=e)
 
             # 2) Webhook (if configured)
             self.post_error_to_webhook(task, e)
