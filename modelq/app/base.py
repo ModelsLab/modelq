@@ -570,6 +570,7 @@ class ModelQ:
                     )
                 # Once streaming is done
                 task.status = "completed"
+                self.redis_client.expire(f"task_stream:{task.task_id}", 3600)  # Expires in 1 hour
                 # Mark finished_at in the final store
                 self._store_final_task_state(task, success=True)
 
