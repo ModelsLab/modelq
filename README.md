@@ -1,6 +1,6 @@
 # ModelQ
 
-![ModelQ Logo](assets/logo.png)
+![ModelQ Logo](assets/logo.PNG)
 
 [![PyPI version](https://img.shields.io/pypi/v/modelq.svg)](https://pypi.org/project/modelq/)
 
