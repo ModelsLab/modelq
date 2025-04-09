@@ -3,6 +3,7 @@
 ![ModelQ Logo](assets/logo.PNG)
 
 [![PyPI version](https://img.shields.io/pypi/v/modelq.svg)](https://pypi.org/project/modelq/)
+[![Downloads](https://img.shields.io/pypi/dm/modelq.svg)](https://pypi.org/project/modelq/)
 
 ModelQ is a lightweight Python library for scheduling and queuing machine learning inference tasks. It's designed as a faster and simpler alternative to Celery for ML workloads, using Redis and threading to efficiently run background tasks.
 
@@ -20,15 +21,15 @@ ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.
 - ✅ Retry support (automatic and manual)
 - ⏱ Timeout handling for long-running tasks
 - 🔁 Manual retry using `RetryTaskException`
-- 🛄 Streaming results from tasks in real-time
+- 🎮 Streaming results from tasks in real-time
 - 🧹 Middleware hooks for task lifecycle events
 - ⚡ Fast, non-blocking concurrency using threads
 - 🧵 Built-in decorators to register tasks quickly
-- 🗃 Redis-based task queueing
+- 💃 Redis-based task queueing
 
 ---
 
-## 📦 Installation
+## 🛆 Installation
 
 ```bash
 pip install modelq
