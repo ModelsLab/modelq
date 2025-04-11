@@ -726,3 +726,23 @@ class ModelQ:
                 )
         except Exception as e2:
             logger.error(f"Exception while sending error to webhook: {e2}")
+            
+    def remove_task_from_queue(self, task_id: str) -> bool:
+        """
+        Removes a task from the 'ml_tasks' queue using its task_id.
+        Returns True if the task was found and removed, False otherwise.
+        """
+        tasks = self.redis_client.lrange("ml_tasks", 0, -1)
+        removed = False
+        for task_json in tasks:
+            try:
+                task_dict = json.loads(task_json)
+                if task_dict.get("task_id") == task_id:
+                    self.redis_client.lrem("ml_tasks", 1, task_json)
+                    self.redis_client.zrem("queued_requests", task_id)
+                    removed = True
+                    logger.info(f"Removed task {task_id} from queue.")
+                    break
+            except Exception as e:
+                logger.error(f"Failed to process task while trying to remove: {e}")
+        return removed
