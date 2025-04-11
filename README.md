@@ -16,7 +16,7 @@ ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.
 > - Audio generation
 > - And much more
 
-## 🚀 Features
+## ✨ Features
 
 - ✅ Retry support (automatic and manual)
 - ⏱ Timeout handling for long-running tasks
@@ -29,7 +29,7 @@ ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.
 
 ---
 
-## 🛆 Installation
+## 🗆 Installation
 
 ```bash
 pip install modelq
@@ -72,6 +72,34 @@ print(task.get_result(q.redis_client))
 
 ---
 
+## ⏰ Cron Task Scheduling (NEW)
+
+ModelQ now supports periodic background tasks using the `@cron_task(interval_seconds=...)` decorator.
+
+Use this to run tasks at regular intervals—great for polling, periodic cleanups, or scheduled retraining!
+
+```python
+from modelq import ModelQ
+from redis import Redis
+import time
+
+db = Redis(host="localhost", port=6379, db=0)
+q = ModelQ(redis_client=db)
+
+@q.cron_task(interval_seconds=10)
+def say_hello():
+    print("Hello from cron task!")
+
+q.start_workers()
+
+while True:
+    time.sleep(1)
+```
+
+🧠 ModelQ runs these cron tasks in a background thread, using in-memory scheduling and Redis to persist the last execution timestamp—without polling Redis constantly.
+
+---
+
 ## ⚙️ Middleware Support
 
 ModelQ allows you to plug in custom middleware to hook into events:
@@ -106,7 +134,7 @@ q.middleware = LoggingMiddleware()
 
 ---
 
-## 🛠 Configuration
+## 🛠️ Configuration
 
 Connect to Redis using custom config:
 

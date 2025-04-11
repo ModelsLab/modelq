@@ -44,3 +44,7 @@ def stream(params):
 
     for new_text in streamer:
         yield new_text
+
+@modelq_app.cron_task(interval_seconds=10)
+def cron_task():
+    print("Cron task running...")

@@ -80,5 +80,8 @@ def add_task():
 def image_task():
     return Image.open("lmao.png")
 
+@modelq.cron_task(interval=10)
+def cron_task():
+    print("Cron task executed")
 
 modelq.start_workers()
