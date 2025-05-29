@@ -73,11 +73,7 @@ class ModelQ:
         self.delay_seconds = delay_seconds
 
         # Register this server in Redis (with an initial heartbeat)
-        self._cron_registry = {}  # function_name: (callable, interval_seconds)
         self.register_server()
-        cron_thread = threading.Thread(target=self._cron_task_loop, daemon=True)
-        cron_thread.start()
-        self.worker_threads.append(cron_thread)
 
     def _connect_to_redis(
         self,
@@ -751,28 +747,3 @@ class ModelQ:
                 logger.error(f"Failed to process task while trying to remove: {e}")
         return removed
     
-    def cron_task(self, interval_seconds: int):
-        def decorator(func):
-            self._cron_registry[func.__name__] = {
-                "func": func,
-                "interval": interval_seconds,
-                "last_run_key": f"cron_task:{func.__name__}:last_run"
-            }
-            self.redis_client.setnx(self._cron_registry[func.__name__]["last_run_key"], 0)
-            logger.info(f"Registered cron task: {func.__name__} to run every {interval_seconds} seconds")
-            return func
-        return decorator
-
-    def _cron_task_loop(self):
-        while True:
-            now = time.time()
-            for name, meta in self._cron_registry.items():
-                try:
-                    last_run = float(self.redis_client.get(meta["last_run_key"]) or 0)
-                    if now - last_run >= meta["interval"]:
-                        logger.info(f"Running scheduled cron task: {name}")
-                        threading.Thread(target=meta["func"], daemon=True).start()
-                        self.redis_client.set(meta["last_run_key"], str(now))
-                except Exception as e:
-                    logger.error(f"Error running cron task {name}: {e}")
-            time.sleep(1)

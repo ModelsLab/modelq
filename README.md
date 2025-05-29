@@ -16,6 +16,8 @@ ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.
 > - Audio generation
 > - And much more
 
+---
+
 ## ✨ Features
 
 - ✅ Retry support (automatic and manual)
@@ -26,6 +28,7 @@ ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.
 - ⚡ Fast, non-blocking concurrency using threads
 - 🧵 Built-in decorators to register tasks quickly
 - 💃 Redis-based task queueing
+- 🖥️ CLI interface for orchestration
 
 ---
 
@@ -34,6 +37,50 @@ ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.
 ```bash
 pip install modelq
 ```
+
+---
+
+## 🖥️ CLI Usage
+
+You can interact with ModelQ using the `modelq` command-line tool. All commands require an `--app-path` parameter to locate your ModelQ instance in `module:object` format.
+
+### Start Workers
+```bash
+modelq run-workers main:modelq_app --workers 2
+```
+Start background worker threads for executing tasks.
+
+### Check Queue Status
+```bash
+modelq status --app-path main:modelq_app
+```
+Show number of servers, queued tasks, and registered task types.
+
+### List Queued Tasks
+```bash
+modelq list-queued --app-path main:modelq_app
+```
+Display a list of all currently queued task IDs and their names.
+
+### Clear the Queue
+```bash
+modelq clear-queue --app-path main:modelq_app
+```
+Remove all tasks from the queue.
+
+### Remove a Specific Task
+```bash
+modelq remove-task --app-path main:modelq_app --task-id <task_id>
+```
+Remove a specific task from the queue by ID.
+
+### Version
+```bash
+modelq version
+```
+Print the current version of ModelQ CLI.
+
+More commands like `requeue-stuck`, `prune-results`, and `get-task-status` are coming soon.
 
 ---
 
@@ -69,34 +116,6 @@ q.start_workers()
 task = add(2, 3)
 print(task.get_result(q.redis_client))
 ```
-
----
-
-## ⏰ Cron Task Scheduling (NEW)
-
-ModelQ now supports periodic background tasks using the `@cron_task(interval_seconds=...)` decorator.
-
-Use this to run tasks at regular intervals—great for polling, periodic cleanups, or scheduled retraining!
-
-```python
-from modelq import ModelQ
-from redis import Redis
-import time
-
-db = Redis(host="localhost", port=6379, db=0)
-q = ModelQ(redis_client=db)
-
-@q.cron_task(interval_seconds=10)
-def say_hello():
-    print("Hello from cron task!")
-
-q.start_workers()
-
-while True:
-    time.sleep(1)
-```
-
-🧠 ModelQ runs these cron tasks in a background thread, using in-memory scheduling and Redis to persist the last execution timestamp—without polling Redis constantly.
 
 ---
 
@@ -160,4 +179,3 @@ ModelQ is released under the MIT License.
 ## 🤝 Contributing
 
 We welcome contributions! Open an issue or submit a PR at [github.com/modelslab/modelq](https://github.com/modelslab/modelq).
-
