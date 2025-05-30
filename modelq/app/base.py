@@ -642,6 +642,7 @@ class ModelQ:
                     task.result = result.model_dump(mode="json")
                 elif isinstance(result, (dict, list, int, float, bool)):
                     task.result = result
+     # only images as base64 string
                 else:
                     task.result = str(result)
 

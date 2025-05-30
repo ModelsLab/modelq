@@ -7,6 +7,7 @@ import time
 import signal
 import threading
 from typing import Optional
+from modelq.app.api.server import run_api
 
 app = typer.Typer(help="ModelQ CLI for managing and queuing tasks.")
 
@@ -158,6 +159,18 @@ def list_queued(app_path: str):
     except Exception as e:
         typer.echo(f"❌ Failed to list queued tasks: {e}")
         raise typer.Exit(1)
+
+@app.command("serve-api")
+def serve_api_cmd(
+    app_path: str,
+    host: str = typer.Option("0.0.0.0", "--host", "-h", help="Host to bind the API server"),
+    port: int = typer.Option(8000, "--port", "-p", help="Port to serve the API"),
+    log_level: str = typer.Option("info", "--log-level", "-l", help="Uvicorn/FastAPI log level")
+):
+    app_instance = load_app_instance(app_path)
+    typer.echo(f"🌐 Starting ModelQ API server on http://{host}:{port} ...")
+    typer.echo(f"   Registered Tasks: {', '.join(app_instance.allowed_tasks) if app_instance.allowed_tasks else 'None'}")
+    run_api(app_instance, host=host, port=port)
 
 if __name__ == "__main__":
     app()

@@ -13,10 +13,10 @@ redis_client = Redis(host="localhost", port=6379, db=0)
 mq = ModelQ(redis_client = redis_client)
 
 
-@mq.task(schema=AddIn, returns=AddOut, timeout=5)
+@mq.task(schema=AddIn, returns=AddOut)
 def add(payload: AddIn) -> AddOut:
     print(f"Processing addition: {payload.a} + {payload.b}")
-    # time.sleep(10)  # Simulate some processing time
+    time.sleep(10)  # Simulate some processing time
     return AddOut(total=payload.a + payload.b)
 
 @mq.task()
@@ -44,17 +44,17 @@ if __name__ == "__main__":
     # Keep the worker running indefinitely
     try:
         while True:
-            output  = job.get_result(mq.redis_client,returns=AddOut)
+            # output  = job.get_result(mq.redis_client,returns=AddOut)
 
-            print(f"Result of addition: {output}")
-            print(type(output))
-            print(f"Result of addition (total): {output.total}")
+            # print(f"Result of addition: {output}")
+            # print(type(output))
+            # print(f"Result of addition (total): {output.total}")
 
-            output2 = job2.get_result(mq.redis_client)
-            print(f"Result of subtraction: {output2}")
+            # output2 = job2.get_result(mq.redis_client)
+            # print(f"Result of subtraction: {output2}")
 
-            output3 = task.get_result(mq.redis_client)
-            print(f"Result of image task: {output3}")
+            # output3 = task.get_result(mq.redis_client)
+            # print(f"Result of image task: {output3}")
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nGracefully shutting down...")
