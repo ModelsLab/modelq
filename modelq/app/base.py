@@ -14,6 +14,9 @@ import requests  # For sending error payloads to a webhook
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError,RetryTaskException
 from modelq.app.middleware import Middleware
+
+from pydantic import BaseModel, ValidationError 
+from typing import Optional, Dict, Any, Type 
 import os
 
 logging.basicConfig(
@@ -342,42 +345,55 @@ class ModelQ:
         timeout: Optional[int] = None,
         stream: bool = False,
         retries: int = 0,
+        schema: Optional[Type[BaseModel]] = None,        # ▶ pydantic
+        returns: Optional[Type[BaseModel]] = None,       # ▶ pydantic
     ):
-        """
-        Decorator to register a function as a task.
-        We create a Task object, set created_at + queued_at, then enqueue.
-        """
         def decorator(func):
+            # make the schema classes discoverable at run time
+            func._mq_schema  = schema                    # ▶ pydantic
+            func._mq_returns = returns                   # ▶ pydantic
+
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
-                task_name = func.__name__
+                # ---------------------------  PRODUCER-SIDE VALIDATION
+                if schema is not None:                   # ▶ pydantic
+                    try:
+                        # allow either a ready-made model instance
+                        # or raw kwargs/args that build one
+                        if len(args) == 1 and isinstance(args[0], schema):
+                            validated = args[0]
+                        else:
+                            validated = schema(*args, **kwargs)
+                    except ValidationError as ve:
+                        raise TaskProcessingError(
+                            func.__name__, f"Input validation failed – {ve}"
+                        )
+                    payload_data = validated.model_dump(mode="json")  # zero-copy
+                    args, kwargs = (), {}          # we’ll carry payload in kwargs only
+                else:
+                    payload_data = {"args": args, "kwargs": kwargs}
+
                 payload = {
-                    "args": args,
-                    "kwargs": kwargs,
+                    "data": payload_data,          # ▶ pydantic – typed or raw
                     "timeout": timeout,
                     "stream": stream,
                     "retries": retries,
                 }
-                # Create the Task object
-                task = task_class(task_name=task_name, payload=payload)
+
+                task = task_class(task_name=func.__name__, payload=payload)
                 if stream:
                     task.stream = True
 
-                # Convert to dict
                 task_dict = task.to_dict()
-
-                # Record creation and queue time
                 now_ts = time.time()
                 task_dict["created_at"] = now_ts
-                task_dict["queued_at"] = now_ts
+                task_dict["queued_at"]  = now_ts
 
-                # Enqueue the task
                 self.enqueue_task(task_dict, payload=payload)
-
-                # Keep a record of the task in Redis
-                self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict),ex=86400)
+                self.redis_client.set(f"task:{task.task_id}",
+                                      json.dumps(task_dict),
+                                      ex=86400)
                 return task
-
             setattr(self, func.__name__, func)
             self.allowed_tasks.add(func.__name__)
             self.register_server()
@@ -548,45 +564,76 @@ class ModelQ:
                 logger.error(f"Task {task.task_name} failed - function not found.")
                 raise TaskProcessingError(task.task_name, "Task function not found")
 
-            logger.info(
-                f"Processing task: {task.task_name} "
-                f"with args: {task.payload.get('args', [])}, "
-                f"kwargs: {task.payload.get('kwargs', {})}"
-            )
+            # ---- New: Check for Pydantic schema
+            schema_cls  = getattr(task_function, "_mq_schema",  None)
+            return_cls  = getattr(task_function, "_mq_returns", None)
+
+            # ---- Prepare args/kwargs based on schema
+            if schema_cls is not None:
+                try:
+                    # Accept either dict or JSON-serialized dict
+                    payload_data = task.payload["data"]
+                    if isinstance(payload_data, str):
+                        import json
+                        payload_data = json.loads(payload_data)
+                    validated_in = schema_cls(**payload_data)
+                except Exception as ve:
+                    task.status = "failed"
+                    task.result = f"Input validation failed – {ve}"
+                    self._store_final_task_state(task, success=False)
+                    logger.error(f"[ModelQ] Input validation failed: {ve}")
+                    raise TaskProcessingError(task.task_name, f"Input validation failed: {ve}")
+                call_args = (validated_in,)
+                call_kwargs = {}
+            else:
+                # Legacy: no schema
+                call_args = tuple(task.payload.get("args", ()))
+                call_kwargs = dict(task.payload.get("kwargs", {}))
 
             timeout = task.payload.get("timeout", None)
             stream = task.payload.get("stream", False)
 
+            logger.info(
+                f"Processing task: {task.task_name} "
+                f"with args: {call_args}, kwargs: {call_kwargs}"
+            )
+
             if stream:
                 # Stream results
-                for result in task_function(
-                    *task.payload["args"],
-                    **task.payload["kwargs"],
-                ):
+                for result in task_function(*call_args, **call_kwargs):
+
                     task.status = "in_progress"
                     self.redis_client.xadd(
                         f"task_stream:{task.task_id}",
-                        {"result": json.dumps(result)}
+                        {"result": json.dumps(result, default=str)}
                     )
                 # Once streaming is done
                 task.status = "completed"
-                self.redis_client.expire(f"task_stream:{task.task_id}", 3600)  # Expires in 1 hour
-                # Mark finished_at in the final store
+                self.redis_client.expire(f"task_stream:{task.task_id}", 3600)
                 self._store_final_task_state(task, success=True)
-
             else:
                 # Standard execution with optional timeout
                 if timeout:
                     result = self._run_with_timeout(
                         task_function, timeout,
-                        *task.payload["args"],
-                        **task.payload["kwargs"]
+                        *call_args, **call_kwargs
                     )
                 else:
                     result = task_function(
-                        *task.payload["args"],
-                        **task.payload["kwargs"]
+                        *call_args, **call_kwargs
                     )
+
+                # ---- New: Output validation for standard result
+                if return_cls is not None:
+                    try:
+                        if not isinstance(result, return_cls):
+                            result = return_cls(**(result if isinstance(result, dict) else result.__dict__))
+                    except Exception as ve:
+                        task.status = "failed"
+                        task.result = f"Output validation failed – {ve}"
+                        self._store_final_task_state(task, success=False)
+                        logger.error(f"[ModelQ] Output validation failed: {ve}")
+                        raise TaskProcessingError(task.task_name, f"Output validation failed: {ve}")
 
                 result_str = task._convert_to_string(result)
                 task.result = result_str
@@ -594,6 +641,7 @@ class ModelQ:
                 self._store_final_task_state(task, success=True)
 
             logger.info(f"Task {task.task_name} completed successfully.")
+
         except RetryTaskException as e:
             logger.warning(f"Task {task.task_name} requested retry: {e}")
             new_task_dict = task.to_dict()
@@ -616,6 +664,7 @@ class ModelQ:
 
         finally:
             self.redis_client.srem("processing_tasks", task.task_id)
+
 
     def _store_final_task_state(self, task: Task, success: bool):
         """
