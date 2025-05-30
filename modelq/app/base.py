@@ -636,8 +636,15 @@ class ModelQ:
                         logger.error(f"[ModelQ] Output validation failed: {ve}")
                         raise TaskProcessingError(task.task_name, f"Output validation failed: {ve}")
 
-                result_str = task._convert_to_string(result)
-                task.result = result_str
+                # When you set `task.result` (in process_task), use this logic:
+                if isinstance(result, BaseModel):
+                    # Pydantic object: store as dict, not string!
+                    task.result = result.model_dump(mode="json")
+                elif isinstance(result, (dict, list, int, float, bool)):
+                    task.result = result
+                else:
+                    task.result = str(result)
+
                 task.status = "completed"
                 self._store_final_task_state(task, success=True)
 

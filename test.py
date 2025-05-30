@@ -44,10 +44,11 @@ if __name__ == "__main__":
     # Keep the worker running indefinitely
     try:
         while True:
-            output  = job.get_result(mq.redis_client)
+            output  = job.get_result(mq.redis_client,returns=AddOut)
 
             print(f"Result of addition: {output}")
             print(type(output))
+            print(f"Result of addition (total): {output.total}")
 
             output2 = job2.get_result(mq.redis_client)
             print(f"Result of subtraction: {output2}")
