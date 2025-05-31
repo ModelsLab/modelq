@@ -77,38 +77,46 @@ class Task:
         except TypeError:
             return str(data)
 
-    def get_result(self, redis_client: redis.Redis, timeout: int = None) -> Any:
+    def get_stream(self, redis_client: redis.Redis) -> Generator[Any, None, None]:
         """
-        Waits for the result of the task until the timeout.
-        Raises TaskProcessingError if the task failed,
-        or TaskTimeoutError if it never completes within the timeout.
+        Generator to yield results from a streaming task.
+        Continuously reads from a Redis stream and stops when
+        the task is completed or failed.
         """
-        if not timeout:
-            timeout = self.timeout
+        stream_key = f"task_stream:{self.task_id}"
+        last_id = "0"
+        completed = False
 
-        start_time = time.time()
-        while time.time() - start_time < timeout:
+        while not completed:
+            # block=1000 => block for up to 1s, count=10 => max 10 messages
+            results = redis_client.xread({stream_key: last_id}, block=1000, count=10)
+            if results:
+                for _, messages in results:
+                    for message_id, message_data in messages:
+                        # print(message_data)
+                        result = json.loads(message_data[b"result"].decode("utf-8"))
+                        yield result
+                        last_id = message_id
+                        # Append to combined_result
+                        self.combined_result += result
+
+            # Check if the task is finished or failed
             task_json = redis_client.get(f"task_result:{self.task_id}")
             if task_json:
                 task_data = json.loads(task_json)
-                self.result = task_data.get("result")
-                self.status = task_data.get("status")
-
-                if self.status == "failed":
-                    # Raise the original error message as a TaskProcessingError
-                    error_message = self.result or "Task failed without an error message"
+                if task_data.get("status") == "completed":
+                    completed = True
+                    # Update local fields
+                    self.status = "completed"
+                    self.result = self.combined_result
+                elif task_data.get("status") == "failed":
+                    error_message = task_data.get("result", "Task failed without an error message")
                     raise TaskProcessingError(
                         task_data.get("task_name", self.task_name),
                         error_message
                     )
-                elif self.status == "completed":
-                    return self.result
-                # If status is something else like 'processing', keep polling
 
-            time.sleep(1)
-
-        # If we exit the loop, we timed out
-        raise TaskTimeoutError(self.task_id)
+        return
 
     def get_result(
         self,

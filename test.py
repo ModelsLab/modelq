@@ -30,12 +30,12 @@ def image_task(params: dict):
     # Simulate image processing
     return "Image processed successfully"
 
-job = add(a=3, b=4)          # ✨ validated on the spot
+# job = add(a=3, b=4)          # ✨ validated on the spot
 
-job2 = sub(a=10, b=5)             # ✨ no schema validation, just a simple task
+# job2 = sub(a=10, b=5)             # ✨ no schema validation, just a simple task
 
-task = image_task({"image": "example.png"})  # ✨ no schema validation, just a simple task
-task2 = image_task(params={"image": "example.png"}) 
+# task = image_task({"image": "example.png"})  # ✨ no schema validation, just a simple task
+# task2 = image_task(params={"image": "example.png"}) 
 import time
 
 if __name__ == "__main__":

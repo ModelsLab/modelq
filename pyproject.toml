@@ -15,6 +15,7 @@ redis = "^4.0.0"
 typer = "^0.16.0"
 fastapi = "^0.115.12"
 uvicorn = "^0.34.2"
+pydantic = "^2.11.5"
 
 [build-system]
 requires = ["poetry-core"]

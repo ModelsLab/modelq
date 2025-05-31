@@ -535,12 +535,12 @@ class ModelQ:
             self.prune_old_task_results(older_than_seconds=self.TASK_RESULT_RETENTION)
             time.sleep(self.PRUNE_CHECK_INTERVAL)
 
-    def check_middleware(self, middleware_event: str):
+    def check_middleware(self, middleware_event: str,task: Optional[Task] = None, error: Optional[Exception] = None):
         """
         Hooks into the Middleware lifecycle if a Middleware instance is attached.
         """
         if self.middleware:
-            self.middleware.execute(event=middleware_event)
+            self.middleware.execute(event=middleware_event,task=task, error=error)
 
     def process_task(self, task: Task) -> None:
         """
@@ -602,7 +602,7 @@ class ModelQ:
             if stream:
                 # Stream results
                 for result in task_function(*call_args, **call_kwargs):
-
+                    import json
                     task.status = "in_progress"
                     self.redis_client.xadd(
                         f"task_stream:{task.task_id}",

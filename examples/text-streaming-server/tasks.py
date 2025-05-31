@@ -10,8 +10,14 @@ from redis import Redis
 from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 from threading import Thread
 
+from huggingface_hub import login
+
+
+login("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")
+
 redis_client = Redis(host="localhost", port=6379, db=0)
 modelq_app = ModelQ(redis_client = redis_client)
+
 
 class Model:
     def __init__(self):
@@ -44,7 +50,3 @@ def stream(params):
 
     for new_text in streamer:
         yield new_text
-
-@modelq_app.cron_task(interval_seconds=10)
-def cron_task():
-    print("Cron task running...")
