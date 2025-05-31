@@ -13,7 +13,7 @@ from threading import Thread
 from huggingface_hub import login
 
 
-login("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")
+login("your token here")  # Replace with your Hugging Face token
 
 redis_client = Redis(host="localhost", port=6379, db=0)
 modelq_app = ModelQ(redis_client = redis_client)
