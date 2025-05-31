@@ -1,5 +1,5 @@
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse,StreamingResponse
 from pydantic import BaseModel
 import uvicorn, json, gc, time
 from typing import Dict, Callable, Any
@@ -95,20 +95,24 @@ def create_api_app(modelq_instance):
                 else:
                     job = _func(payload)
 
-                # ----- quick result (3 s) -----
                 try:
-                    result = job.get_result(
-                        modelq_instance.redis_client,
-                        timeout=3,
-                        returns=_returns,
-                        modelq_ref=modelq_instance,
-                    )
-                    if isinstance(result, BaseModel):
-                        return JSONResponse(content=result.model_dump())
-                    elif isinstance(result, dict):
-                        return JSONResponse(content=result)
+                    if job.stream:
+                        return StreamingResponse(
+                            job.get_stream(modelq_instance.redis_client), media_type="text/event-stream"
+                        )
                     else:
-                        return JSONResponse(content={"result": result})
+                        result = job.get_result(
+                            modelq_instance.redis_client,
+                            timeout=3,
+                            returns=_returns,
+                            modelq_ref=modelq_instance,
+                        )
+                        if isinstance(result, BaseModel):
+                            return JSONResponse(content=result.model_dump())
+                        elif isinstance(result, dict):
+                            return JSONResponse(content=result)
+                        else:
+                            return JSONResponse(content={"result": result})
 
                 except TaskTimeoutError:
                     return JSONResponse(
