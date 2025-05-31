@@ -10,30 +10,132 @@ ModelQ is a lightweight Python library for scheduling and queuing machine learni
 ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.com/).
 
 > **About Modelslab**: Modelslab provides powerful APIs for AI-native applications including:
-> - Image generation
-> - Uncensored chat
-> - Video generation
-> - Audio generation
-> - And much more
-
-## 🚀 Features
-
-- ✅ Retry support (automatic and manual)
-- ⏱ Timeout handling for long-running tasks
-- 🔁 Manual retry using `RetryTaskException`
-- 🎮 Streaming results from tasks in real-time
-- 🧹 Middleware hooks for task lifecycle events
-- ⚡ Fast, non-blocking concurrency using threads
-- 🧵 Built-in decorators to register tasks quickly
-- 💃 Redis-based task queueing
+>
+> * Image generation
+> * Uncensored chat
+> * Video generation
+> * Audio generation
+> * And much more
 
 ---
 
-## 🛆 Installation
+## ✨ Features
+
+* ✅ Retry support (automatic and manual)
+* ⏱ Timeout handling for long-running tasks
+* 🔁 Manual retry using `RetryTaskException`
+* 🎮 Streaming results from tasks in real-time
+* 🧹 Middleware hooks for task lifecycle events
+* ⚡ Fast, non-blocking concurrency using threads
+* 🧵 Built-in decorators to register tasks quickly
+* 💃 Redis-based task queueing
+* 🖥️ CLI interface for orchestration
+* 🔢 Pydantic model support for task validation and typing
+* 🌐 Auto-generated REST API for tasks
+
+---
+
+## 🗆 Installation
 
 ```bash
 pip install modelq
 ```
+
+---
+
+## 🚀 Auto-Generated REST API
+
+One of ModelQ's most powerful features is the ability to **expose your tasks as HTTP endpoints automatically**.
+
+By running a single command, every registered task becomes an API route:
+
+```bash
+modelq serve-api --app-path main:modelq_app --host 0.0.0.0 --port 8000
+```
+
+### How It Works
+
+* Each task registered with `@q.task(...)` is turned into a POST endpoint under `/tasks/{task_name}`
+* If your task uses Pydantic input/output, the endpoint will validate the request and return a proper response schema
+* The API is built using FastAPI, so you get automatic Swagger docs at:
+
+```
+http://localhost:8000/docs
+```
+
+### Example Usage
+
+```bash
+curl -X POST http://localhost:8000/tasks/add \
+  -H "Content-Type: application/json" \
+  -d '{"a": 3, "b": 7}'
+```
+
+You can now build ML inference APIs without needing to write any web code!
+
+---
+
+## 🖥️ CLI Usage
+
+You can interact with ModelQ using the `modelq` command-line tool. All commands require an `--app-path` parameter to locate your ModelQ instance in `module:object` format.
+
+### Start Workers
+
+```bash
+modelq run-workers main:modelq_app --workers 2
+```
+
+Start background worker threads for executing tasks.
+
+### Check Queue Status
+
+```bash
+modelq status --app-path main:modelq_app
+```
+
+Show number of servers, queued tasks, and registered task types.
+
+### List Queued Tasks
+
+```bash
+modelq list-queued --app-path main:modelq_app
+```
+
+Display a list of all currently queued task IDs and their names.
+
+### Clear the Queue
+
+```bash
+modelq clear-queue --app-path main:modelq_app
+```
+
+Remove all tasks from the queue.
+
+### Remove a Specific Task
+
+```bash
+modelq remove-task --app-path main:modelq_app --task-id <task_id>
+```
+
+Remove a specific task from the queue by ID.
+
+### Serve API
+
+```bash
+modelq serve-api --app-path main:modelq_app --host 0.0.0.0 --port 8000 --log-level info
+```
+
+Start a FastAPI server for ModelQ to accept task submissions over HTTP.
+
+### Version
+
+```bash
+modelq version
+```
+
+Print the current version of ModelQ CLI.
+
+More commands like `requeue-stuck`, `prune-results`, and `get-task-status` are coming soon.
 
 ---
 
@@ -72,18 +174,58 @@ print(task.get_result(q.redis_client))
 
 ---
 
+## 🔢 Pydantic Support
+
+ModelQ supports **Pydantic models** as both input and output types for tasks. This allows automatic validation of input parameters and structured return values.
+
+### Example
+
+```python
+from pydantic import BaseModel, Field
+from redis import Redis
+from modelq import ModelQ
+import time
+
+class AddIn(BaseModel):
+    a: int = Field(ge=0)
+    b: int = Field(ge=0)
+
+class AddOut(BaseModel):
+    total: int
+
+redis_client = Redis(host="localhost", port=6379, db=0)
+mq = ModelQ(redis_client=redis_client)
+
+@mq.task(schema=AddIn, returns=AddOut)
+def add(payload: AddIn) -> AddOut:
+    print(f"Processing addition: {payload.a} + {payload.b}.")
+    time.sleep(10)  # Simulate some processing time
+    return AddOut(total=payload.a + payload.b)
+```
+
+### Getting Result
+
+```python
+output = job.get_result(mq.redis_client, returns=AddOut)
+```
+
+ModelQ will validate inputs using Pydantic and serialize/deserialize results seamlessly.
+
+---
+
 ## ⚙️ Middleware Support
 
 ModelQ allows you to plug in custom middleware to hook into events:
 
 ### Supported Events
-- `before_worker_boot`
-- `after_worker_boot`
-- `before_worker_shutdown`
-- `after_worker_shutdown`
-- `before_enqueue`
-- `after_enqueue`
-- `on_error`
+
+* `before_worker_boot`
+* `after_worker_boot`
+* `before_worker_shutdown`
+* `after_worker_shutdown`
+* `before_enqueue`
+* `after_enqueue`
+* `on_error`
 
 ### Example
 
@@ -106,7 +248,7 @@ q.middleware = LoggingMiddleware()
 
 ---
 
-## 🛠 Configuration
+## 🛠️ Configuration
 
 Connect to Redis using custom config:
 
@@ -132,4 +274,3 @@ ModelQ is released under the MIT License.
 ## 🤝 Contributing
 
 We welcome contributions! Open an issue or submit a PR at [github.com/modelslab/modelq](https://github.com/modelslab/modelq).
-

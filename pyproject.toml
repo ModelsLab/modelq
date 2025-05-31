@@ -1,17 +1,21 @@
 [tool.poetry]
 name = "modelq"
-version = "0.1.28"
+version = "1.0.0"
 description = "Celery-like task queue for ML inference."
 authors = ["Tanmaypatil123 <tanmay@modelslab.com>"]
 readme = "README.md"
 
 [tool.poetry.scripts]
-modelq = "modelq.app:run_worker"
+modelq = "modelq.app.cli.main:app"
 
 [tool.poetry.dependencies]
 python = "^3.9"
 click = "^8.0.0"
 redis = "^4.0.0"
+typer = "^0.16.0"
+fastapi = "^0.115.12"
+uvicorn = "^0.34.2"
+pydantic = "^2.11.5"
 
 [build-system]
 requires = ["poetry-core"]
