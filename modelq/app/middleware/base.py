@@ -17,6 +17,8 @@ class Middleware:
             self.after_enqueue(*args, **kwargs)
         elif event == "on_timeout":
             self.on_timeout(*args, **kwargs)
+        elif event == "on_error":
+            self.on_error(*args, **kwargs)
         # Add more events as needed
 
     def before_worker_boot(self):
