@@ -587,10 +587,8 @@ class ModelQ:
                 call_kwargs = {}
             else:
                 # Legacy: no schema
-                print(task.payload)
                 call_args = tuple(task.payload['data'].get("args", ()))
                 call_kwargs = dict(task.payload['data'].get("kwargs", {}))
-            print(f"call_args: {call_args}, call_kwargs: {call_kwargs}")
             timeout = task.payload.get("timeout", None)
             stream = task.payload.get("stream", False)
 
