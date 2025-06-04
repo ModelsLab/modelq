@@ -1,5 +1,3 @@
-# ModelQ
-
 <p align="center">
   <img src="https://github.com/user-attachments/assets/cc70c81b-b523-4801-b978-109dd3e00ae8" alt="new one" />
 </p>
@@ -15,6 +13,9 @@
     <img src="https://img.shields.io/badge/GitHub-ModelsLab-181717?style=for-the-badge&logo=github&logoColor=white" alt="GitHub">
   </a>
 </div>
+
+
+# ModelQ
 
 ![ModelQ Logo](assets/logo.PNG)
 
