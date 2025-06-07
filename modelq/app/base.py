@@ -284,3 +284,6 @@ class ModelQ:
         th.start(); th.join(timeout)
         if th.is_alive():
             raise TaskTimeoutError(func.__name__, timeout)
+        if exc[0]:
+            raise exc[0]
+        return res[0]

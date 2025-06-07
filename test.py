@@ -56,8 +56,8 @@ if __name__ == "__main__":
             output2 = job2.get_result()
             print(f"Result of subtraction: {output2}")
 
-            output3 = task.get_result(mq.redis_client)
-            print(f"Result of image task: {output3}")
+            # output3 = task.get_result(mq.redis_client)
+            # print(f"Result of image task: {output3}")
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nGracefully shutting down...")

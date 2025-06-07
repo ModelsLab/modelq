@@ -6,23 +6,71 @@ from modelq.app.backends.base import QueueBackend
 
 
 class RedisQueueBackend(QueueBackend):
+
     def __init__(self, redis_client: redis.Redis):
         self.redis = redis_client
+        self._register_scripts()
 
     # ─────────────────────── Task Queue ───────────────────────────────
+    def _register_scripts(self) -> None:
+        # enqueue_task  (list + sorted-set in one shot)
+        self._enqueue_sha = self.redis.script_load("""
+            -- KEYS[1] = ml_tasks, KEYS[2] = queued_requests
+            -- ARGV[1] = full task JSON, ARGV[2] = task_id, ARGV[3] = queued_at
+            redis.call('RPUSH', KEYS[1], ARGV[1])
+            redis.call('ZADD', KEYS[2], ARGV[3], ARGV[2])
+            return 1
+        """)
+
+        # dequeue_ready_delayed_tasks (atomically move due jobs)
+        self._promote_delayed_sha = self.redis.script_load("""
+            -- KEYS[1] = delayed_tasks, KEYS[2] = ml_tasks, ARGV[1] = now
+            local ready = redis.call('ZRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+            if #ready == 0 then return {} end
+            redis.call('ZREMRANGEBYSCORE', KEYS[1], 0, ARGV[1])
+            for i=1,#ready do
+                redis.call('LPUSH', KEYS[2], ready[i])
+            end
+            return ready   -- array of JSON strings
+        """)
+
+        # remove_task_from_queue  (search & delete server-side)
+        self._remove_sha = self.redis.script_load("""
+            -- KEYS[1] = ml_tasks, KEYS[2] = queued_requests, ARGV[1] = task_id
+            local len   = redis.call('LLEN', KEYS[1])
+            for i=0, len-1 do
+                local item = redis.call('LINDEX', KEYS[1], i)
+                if item then
+                    local ok, obj = pcall(cjson.decode, item)
+                    if ok and obj['task_id'] == ARGV[1] then
+                        redis.call('LSET',  KEYS[1], i, '__DEL__')
+                        redis.call('LREM',  KEYS[1], 0,  '__DEL__')
+                        redis.call('ZREM',  KEYS[2], ARGV[1])
+                        return 1
+                    end
+                end
+            end
+            return 0
+        """)
 
     def enqueue_task(self, task_data: dict) -> None:
         task_data["status"] = "queued"
-        self.redis.rpush("ml_tasks", json.dumps(task_data))
-        self.redis.zadd("queued_requests", {task_data["task_id"]: task_data["queued_at"]})
-
+        self.redis.evalsha(
+            self._enqueue_sha,
+            2,                       # number of KEYS
+            "ml_tasks", "queued_requests",
+            json.dumps(task_data),   # ARGV[1]
+            task_data["task_id"],    # ARGV[2]
+            task_data["queued_at"],  # ARGV[3]
+        )
+            
     def dequeue_task(self, timeout: Optional[int] = None) -> Optional[dict]:
-        data = self.redis.blpop("ml_tasks", timeout=timeout or 5)
-        if data:
-            _, task_json = data
-            return json.loads(task_json)
+        rv = self.redis.blpop("ml_tasks", timeout or 5)
+        if rv:
+            _, raw = rv
+            return json.loads(raw)
         return None
-
+    
     def requeue_task(self, task_data: dict) -> None:
         self.redis.rpush("ml_tasks", json.dumps(task_data))
 
@@ -31,12 +79,12 @@ class RedisQueueBackend(QueueBackend):
         self.redis.zadd("delayed_tasks", {json.dumps(task_data): run_at})
 
     def dequeue_ready_delayed_tasks(self) -> list:
-        now = time.time()
-        tasks = self.redis.zrangebyscore("delayed_tasks", 0, now)
-        for task_json in tasks:
-            self.redis.zrem("delayed_tasks", task_json)
-            self.redis.lpush("ml_tasks", task_json)
-        return [json.loads(t) for t in tasks]
+        # Single RTT instead of ZRANGEBYSCORE + loop in Python
+        ready = self.redis.evalsha(
+            self._promote_delayed_sha,
+            2, "delayed_tasks", "ml_tasks", time.time()
+        )
+        return [json.loads(j) for j in ready]
 
     def flush_queue(self) -> None:
         self.redis.ltrim("ml_tasks", 1, 0)
@@ -45,22 +93,20 @@ class RedisQueueBackend(QueueBackend):
 
     def save_task_state(self, task_id: str, task_data: dict, result: bool) -> None:
         task_data["finished_at"] = time.time()
-        self.redis.set(f"task_result:{task_id}", json.dumps(task_data), ex=3600)
-        self.redis.set(f"task:{task_id}", json.dumps(task_data), ex=86400)
+        with self.redis.pipeline() as pipe:       # tiny but measurable
+            pipe.set(f"task_result:{task_id}", json.dumps(task_data), ex=3600)
+            pipe.set(f"task:{task_id}",         json.dumps(task_data), ex=86400)
+            pipe.execute()
 
     def load_task_state(self, task_id: str) -> Optional[dict]:
         data = self.redis.get(f"task:{task_id}")
         return json.loads(data) if data else None
 
     def remove_task_from_queue(self, task_id: str) -> bool:
-        tasks = self.redis.lrange("ml_tasks", 0, -1)
-        for task_json in tasks:
-            task_dict = json.loads(task_json)
-            if task_dict.get("task_id") == task_id:
-                self.redis.lrem("ml_tasks", 1, task_json)
-                self.redis.zrem("queued_requests", task_id)
-                return True
-        return False
+        return bool(self.redis.evalsha(
+            self._remove_sha,
+            2, "ml_tasks", "queued_requests", task_id
+        ))
 
     def mark_processing(self, task_id: str) -> bool:
         return self.redis.sadd("processing_tasks", task_id) == 1
