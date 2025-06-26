@@ -14,6 +14,7 @@ import requests  # For sending error payloads to a webhook
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError,RetryTaskException
 from modelq.app.middleware import Middleware
+from modelq.app.redis_retry import _RedisWithRetry
 
 from pydantic import BaseModel, ValidationError 
 from typing import Optional, Dict, Any, Type 
@@ -47,10 +48,21 @@ class ModelQ:
         webhook_url: Optional[str] = None,  # Optional webhook for error logging
         requeue_threshold : Optional[int] = None ,
         delay_seconds: int = 30,
+        redis_retry_attempts: int = 5,
+        redis_retry_base_delay: float = 0.5,
+        redis_retry_backoff: float = 2.0,
+        redis_retry_jitter: float = 0.3,
         **kwargs,
     ):
         if redis_client:
-            self.redis_client = redis_client
+            self.redis_client = _RedisWithRetry(
+                redis_client,
+                max_attempts=redis_retry_attempts,
+                base_delay=redis_retry_base_delay,
+                backoff=redis_retry_backoff,
+                jitter=redis_retry_jitter,
+            )
+
         else:
             self.redis_client = self._connect_to_redis(
                 host=host,
