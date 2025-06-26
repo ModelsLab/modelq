@@ -30,12 +30,12 @@ def image_task(params: dict):
     # Simulate image processing
     return "Image processed successfully"
 
-# job = add(a=3, b=4)          # ✨ validated on the spot
+job = add(a=3, b=4)          # ✨ validated on the spot
 
-# job2 = sub(a=10, b=5)             # ✨ no schema validation, just a simple task
+job2 = sub(a=10, b=5)             # ✨ no schema validation, just a simple task
 
-# task = image_task({"image": "example.png"})  # ✨ no schema validation, just a simple task
-# task2 = image_task(params={"image": "example.png"}) 
+task = image_task({"image": "example.png"})  # ✨ no schema validation, just a simple task
+task2 = image_task(params={"image": "example.png"}) 
 import time
 
 if __name__ == "__main__":
@@ -44,17 +44,17 @@ if __name__ == "__main__":
     # Keep the worker running indefinitely
     try:
         while True:
-            # output  = job.get_result(mq.redis_client,returns=AddOut)
+            output  = job.get_result(mq.redis_client,returns=AddOut)
 
-            # print(f"Result of addition: {output}")
-            # print(type(output))
-            # print(f"Result of addition (total): {output.total}")
+            print(f"Result of addition: {output}")
+            print(type(output))
+            print(f"Result of addition (total): {output.total}")
 
-            # output2 = job2.get_result(mq.redis_client)
-            # print(f"Result of subtraction: {output2}")
+            output2 = job2.get_result(mq.redis_client)
+            print(f"Result of subtraction: {output2}")
 
-            # output3 = task.get_result(mq.redis_client)
-            # print(f"Result of image task: {output3}")
+            output3 = task.get_result(mq.redis_client)
+            print(f"Result of image task: {output3}")
             time.sleep(1)
     except KeyboardInterrupt:
         print("\nGracefully shutting down...")
