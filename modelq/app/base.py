@@ -815,3 +815,51 @@ class ModelQ:
                 logger.error(f"Failed to process task while trying to remove: {e}")
         return removed
     
+    def get_processing_tasks(self) -> list[Dict[str, Any]]:
+        """
+        Returns a list of task dicts that are currently in 'processing' state.
+        It cross-checks the 'processing_tasks' Redis set with the per-task keys
+        (task:{task_id}) and cleans up stale/mismatched entries.
+        """
+        results: list[Dict[str, Any]] = []
+
+        # 1) Fetch all task IDs the workers marked as processing
+        raw_ids = self.redis_client.smembers("processing_tasks")
+        task_ids = [
+            tid.decode("utf-8") if isinstance(tid, (bytes, bytearray)) else tid
+            for tid in raw_ids
+        ]
+        if not task_ids:
+            return results
+
+        # 2) Batch fetch their task records with a pipeline to minimize RTT
+        keys = [f"task:{tid}" for tid in task_ids]
+        with self.redis_client.pipeline() as pipe:
+            for k in keys:
+                pipe.get(k)
+            task_jsons = pipe.execute()
+
+        # 3) Validate & filter to status == 'processing'
+        for tid, tjson in zip(task_ids, task_jsons):
+            if not tjson:
+                # No task record -> remove stale entry from processing set
+                self.redis_client.srem("processing_tasks", tid)
+                logger.warning(f"Stale processing entry removed (no record): {tid}")
+                continue
+
+            try:
+                task_dict = json.loads(tjson)
+            except Exception as e:
+                logger.error(f"Failed to parse task record for {tid}: {e}")
+                # Conservatively remove from processing set if corrupted
+                self.redis_client.srem("processing_tasks", tid)
+                continue
+
+            status = task_dict.get("status")
+            if status == "processing":
+                results.append(task_dict)
+            else:
+                # If status drifted away from 'processing', tidy up the set
+                self.redis_client.srem("processing_tasks", tid)
+
+        return results
