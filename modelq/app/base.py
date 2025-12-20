@@ -32,6 +32,7 @@ class ModelQ:
     PRUNE_TIMEOUT = 300         # seconds: how long before a server is considered stale
     PRUNE_CHECK_INTERVAL = 60   # seconds: how often to check for stale servers
     TASK_RESULT_RETENTION = 86400
+    TASK_HISTORY_RETENTION = 604800  # 7 days in seconds
 
     def __init__(
         self,
@@ -129,6 +130,28 @@ class ModelQ:
             "last_heartbeat": time.time(),
         }
         self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
+
+    def _add_to_task_history(self, task_id: str, task_dict: dict) -> None:
+        """
+        Adds a task to the task history sorted set and stores its data.
+        """
+        score = task_dict.get("created_at", time.time())
+        self.redis_client.zadd("task_history", {task_id: score})
+        self.redis_client.set(
+            f"task_history:{task_id}",
+            json.dumps(task_dict),
+            ex=self.TASK_HISTORY_RETENTION
+        )
+
+    def _update_task_history(self, task_id: str, task_dict: dict) -> None:
+        """
+        Updates the task data in history with final state.
+        """
+        self.redis_client.set(
+            f"task_history:{task_id}",
+            json.dumps(task_dict),
+            ex=self.TASK_HISTORY_RETENTION
+        )
 
     def requeue_stuck_processing_tasks(self, threshold: float = 180.0):
         """
@@ -280,12 +303,16 @@ class ModelQ:
         # Ensure status is 'queued'
         task_data["status"] = "queued"
         self.check_middleware("before_enqueue")
-        # If the decorator didn’t set queued_at, set it now
+        # If the decorator didn't set queued_at, set it now
         if "queued_at" not in task_data:
             task_data["queued_at"] = time.time()
 
         self.redis_client.rpush("ml_tasks", json.dumps(task_data))
         self.redis_client.zadd("queued_requests", {task_data["task_id"]: task_data["queued_at"]})
+
+        # Add to task history
+        self._add_to_task_history(task_data["task_id"], task_data)
+
         self.check_middleware("after_enqueue")
 
     def delete_queue(self):
@@ -564,17 +591,19 @@ class ModelQ:
             if task.task_name not in self.allowed_tasks:
                 task.status = "failed"
                 task.result = "Task not allowed on this server."
-                self._store_final_task_state(task)
+                err = TaskProcessingError(task.task_name, "Task not allowed")
+                self._store_final_task_state(task, success=False, error=err)
                 logger.error(f"Task {task.task_name} is not allowed on this server.")
-                raise TaskProcessingError(task.task_name, "Task not allowed")
+                raise err
 
             task_function = getattr(self, task.task_name, None)
             if not task_function:
                 task.status = "failed"
                 task.result = "Task function not found"
-                self._store_final_task_state(task)
+                err = TaskProcessingError(task.task_name, "Task function not found")
+                self._store_final_task_state(task, success=False, error=err)
                 logger.error(f"Task {task.task_name} failed - function not found.")
-                raise TaskProcessingError(task.task_name, "Task function not found")
+                raise err
 
             # ---- New: Check for Pydantic schema
             schema_cls  = getattr(task_function, "_mq_schema",  None)
@@ -592,7 +621,7 @@ class ModelQ:
                 except Exception as ve:
                     task.status = "failed"
                     task.result = f"Input validation failed – {ve}"
-                    self._store_final_task_state(task, success=False)
+                    self._store_final_task_state(task, success=False, error=ve)
                     logger.error(f"[ModelQ] Input validation failed: {ve}")
                     raise TaskProcessingError(task.task_name, f"Input validation failed: {ve}")
                 call_args = (validated_in,)
@@ -642,7 +671,7 @@ class ModelQ:
                     except Exception as ve:
                         task.status = "failed"
                         task.result = f"Output validation failed – {ve}"
-                        self._store_final_task_state(task, success=False)
+                        self._store_final_task_state(task, success=False, error=ve)
                         logger.error(f"[ModelQ] Output validation failed: {ve}")
                         raise TaskProcessingError(task.task_name, f"Output validation failed: {ve}")
 
@@ -670,7 +699,7 @@ class ModelQ:
             # Mark as failed
             task.status = "failed"
             task.result = str(e)
-            self._store_final_task_state(task, success=False)
+            self._store_final_task_state(task, success=False, error=e)
 
             # 1) Log to file
             self.log_task_error_to_file(task, e)
@@ -685,15 +714,26 @@ class ModelQ:
             self.redis_client.srem("processing_tasks", task.task_id)
 
 
-    def _store_final_task_state(self, task: Task, success: bool):
+    def _store_final_task_state(self, task: Task, success: bool, error: Optional[Exception] = None):
         """
         Persists the final status/result of the task in Redis, adding finished_at.
+        Also includes error details if task failed.
         """
         task_dict = task.to_dict()
 
         # Mark finished_at
         task_dict["finished_at"] = time.time()
-        
+
+        # Add error details if failed
+        if not success and error:
+            task_dict["error"] = {
+                "message": str(error),
+                "type": type(error).__name__,
+                "file": getattr(error, "__traceback__", None) and error.__traceback__.tb_frame.f_code.co_filename or None,
+                "line": getattr(error, "__traceback__", None) and error.__traceback__.tb_lineno or None,
+                "trace": traceback.format_exc(),
+            }
+
         self.redis_client.set(
             f"task_result:{task.task_id}",
             json.dumps(task_dict),
@@ -704,6 +744,9 @@ class ModelQ:
             json.dumps(task_dict),
             ex=86400
         )
+
+        # Update task history
+        self._update_task_history(task.task_id, task_dict)
 
         
     def _run_with_timeout(self, func, timeout, *args, **kwargs):
@@ -863,3 +906,174 @@ class ModelQ:
                 self.redis_client.srem("processing_tasks", tid)
 
         return results
+
+    # ============================================
+    # Task History Methods
+    # ============================================
+
+    def get_task_details(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get full details of a task including error information if failed.
+        First checks task_history, then falls back to task: key.
+        """
+        # Try history first
+        data = self.redis_client.get(f"task_history:{task_id}")
+        if data:
+            return json.loads(data)
+
+        # Fallback to task key
+        data = self.redis_client.get(f"task:{task_id}")
+        if data:
+            return json.loads(data)
+
+        return None
+
+    def get_task_history(
+        self,
+        limit: int = 100,
+        offset: int = 0,
+        status: Optional[str] = None,
+        task_name: Optional[str] = None
+    ) -> list[Dict[str, Any]]:
+        """
+        Get task history with optional filters.
+        Returns tasks ordered by creation time (most recent first).
+        """
+        # Get task IDs from sorted set (most recent first)
+        task_ids = self.redis_client.zrevrange("task_history", 0, -1)
+
+        if not task_ids:
+            return []
+
+        results = []
+        skipped = 0
+
+        for tid_bytes in task_ids:
+            tid = tid_bytes.decode("utf-8") if isinstance(tid_bytes, bytes) else tid_bytes
+            data = self.redis_client.get(f"task_history:{tid}")
+
+            if not data:
+                continue
+
+            task_dict = json.loads(data)
+
+            # Apply filters
+            if status and task_dict.get("status") != status:
+                continue
+            if task_name and task_dict.get("task_name") != task_name:
+                continue
+
+            # Apply offset
+            if skipped < offset:
+                skipped += 1
+                continue
+
+            results.append(task_dict)
+
+            if len(results) >= limit:
+                break
+
+        return results
+
+    def get_failed_tasks(self, limit: int = 100) -> list[Dict[str, Any]]:
+        """
+        Get tasks that have failed.
+        Convenience method that filters by status='failed'.
+        """
+        return self.get_task_history(limit=limit, status="failed")
+
+    def get_completed_tasks(self, limit: int = 100) -> list[Dict[str, Any]]:
+        """
+        Get tasks that have completed successfully.
+        Convenience method that filters by status='completed'.
+        """
+        return self.get_task_history(limit=limit, status="completed")
+
+    def get_tasks_by_name(self, task_name: str, limit: int = 100) -> list[Dict[str, Any]]:
+        """
+        Get tasks filtered by task name.
+        """
+        return self.get_task_history(limit=limit, task_name=task_name)
+
+    def get_task_stats(self) -> Dict[str, Any]:
+        """
+        Get statistics about tasks in history.
+        """
+        task_ids = self.redis_client.zrange("task_history", 0, -1)
+
+        stats = {
+            "total": 0,
+            "by_status": {},
+            "by_task_name": {},
+            "failed_tasks": [],
+        }
+
+        if not task_ids:
+            return stats
+
+        for tid_bytes in task_ids:
+            tid = tid_bytes.decode("utf-8") if isinstance(tid_bytes, bytes) else tid_bytes
+            data = self.redis_client.get(f"task_history:{tid}")
+
+            if not data:
+                continue
+
+            task_dict = json.loads(data)
+            stats["total"] += 1
+
+            # Count by status
+            status = task_dict.get("status", "unknown")
+            stats["by_status"][status] = stats["by_status"].get(status, 0) + 1
+
+            # Count by task name
+            name = task_dict.get("task_name", "unknown")
+            if name not in stats["by_task_name"]:
+                stats["by_task_name"][name] = {"total": 0, "completed": 0, "failed": 0}
+            stats["by_task_name"][name]["total"] += 1
+            if status == "completed":
+                stats["by_task_name"][name]["completed"] += 1
+            elif status == "failed":
+                stats["by_task_name"][name]["failed"] += 1
+
+            # Collect failed task summaries (last 10)
+            if status == "failed" and len(stats["failed_tasks"]) < 10:
+                error_msg = task_dict.get("error", {}).get("message", task_dict.get("result", "Unknown error"))
+                stats["failed_tasks"].append({
+                    "task_id": tid,
+                    "task_name": name,
+                    "error": error_msg,
+                })
+
+        return stats
+
+    def get_task_history_count(self) -> int:
+        """
+        Get the total number of tasks in history.
+        """
+        return self.redis_client.zcard("task_history")
+
+    def clear_task_history(self, older_than_seconds: int = None) -> int:
+        """
+        Clear old entries from task history.
+        Default is to clear entries older than TASK_HISTORY_RETENTION (7 days).
+        Returns the number of entries removed.
+        """
+        if older_than_seconds is None:
+            older_than_seconds = self.TASK_HISTORY_RETENTION
+
+        cutoff = time.time() - older_than_seconds
+        removed = 0
+
+        # Get task IDs older than cutoff
+        old_task_ids = self.redis_client.zrangebyscore("task_history", 0, cutoff)
+
+        for tid_bytes in old_task_ids:
+            tid = tid_bytes.decode("utf-8") if isinstance(tid_bytes, bytes) else tid_bytes
+            self.redis_client.delete(f"task_history:{tid}")
+            self.redis_client.zrem("task_history", tid)
+            removed += 1
+
+        if removed > 0:
+            logger.info(f"Cleared {removed} task(s) from history older than {older_than_seconds} seconds.")
+
+        return removed
