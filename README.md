@@ -49,6 +49,9 @@ ModelQ is developed and maintained by the team at [Modelslab](https://modelslab.
 * 🖥️ CLI interface for orchestration
 * 🔢 Pydantic model support for task validation and typing
 * 🌐 Auto-generated REST API for tasks
+* 🚫 Task cancellation for queued or running tasks
+* 📊 Progress tracking for long-running tasks
+* 📜 Task history with configurable retention
 
 ---
 
@@ -265,6 +268,171 @@ q.middleware = LoggingMiddleware()
 
 ---
 
+## 🚫 Task Cancellation
+
+ModelQ supports cancelling tasks that are queued or in progress. This is useful for long-running ML inference tasks that need to be stopped.
+
+### Cancelling a Task
+
+```python
+from modelq import ModelQ
+from redis import Redis
+
+redis_client = Redis(host="localhost", port=6379, db=0)
+mq = ModelQ(redis_client=redis_client)
+
+# Enqueue a task
+task = my_long_task({"data": "value"})
+
+# Cancel the task
+cancelled = mq.cancel_task(task.task_id)
+if cancelled:
+    print(f"Task {task.task_id} was cancelled")
+```
+
+### Checking Cancellation Status
+
+```python
+# Check if a task was cancelled
+if mq.is_task_cancelled(task.task_id):
+    print("Task was cancelled")
+
+# Get all cancelled tasks
+cancelled_tasks = mq.get_cancelled_tasks(limit=100)
+for t in cancelled_tasks:
+    print(f"Cancelled: {t['task_id']} - {t['task_name']}")
+```
+
+### Handling Cancellation Inside a Task
+
+For long-running tasks, you should periodically check for cancellation and exit gracefully:
+
+```python
+@mq.task()
+def long_running_task(params: dict):
+    items = params.get("items", [])
+    results = []
+
+    for i, item in enumerate(items):
+        # Check if task was cancelled
+        task_id = params.get("_task_id")  # Task ID is injected
+        if task_id and mq.is_task_cancelled(task_id):
+            return {"status": "cancelled", "processed": i}
+
+        # Process item
+        result = process_item(item)
+        results.append(result)
+
+    return {"status": "completed", "results": results}
+```
+
+### Cancellation in Streaming Tasks
+
+Streaming tasks automatically check for cancellation and will stop yielding results:
+
+```python
+task = my_streaming_task({"prompt": "Generate text"})
+
+# Start consuming stream in another thread/process
+# ...
+
+# Cancel from main thread
+mq.cancel_task(task.task_id)
+# The stream will stop gracefully
+```
+
+---
+
+## 📊 Progress Tracking
+
+For long-running tasks, you can report progress to let clients know how far along the task is.
+
+### Reporting Progress Inside a Task
+
+```python
+@mq.task()
+def train_model(params: dict):
+    task_id = params.get("_task_id")
+    epochs = params.get("epochs", 10)
+
+    for epoch in range(epochs):
+        # Report progress (0.0 to 1.0)
+        progress = (epoch + 1) / epochs
+        mq.report_progress(task_id, progress, f"Training epoch {epoch + 1}/{epochs}")
+
+        # Do actual training
+        train_epoch(epoch)
+
+    return {"status": "completed", "epochs": epochs}
+```
+
+### Getting Progress from Client Side
+
+```python
+import time
+
+task = train_model({"epochs": 100})
+
+# Poll for progress
+while True:
+    progress = mq.get_task_progress(task.task_id)
+    if progress:
+        print(f"Progress: {progress['progress'] * 100:.1f}% - {progress['message']}")
+
+    # Check if task is done
+    details = mq.get_task_details(task.task_id)
+    if details and details['status'] in ['completed', 'failed']:
+        break
+
+    time.sleep(1)
+
+# Get final result
+result = task.get_result(mq.redis_client)
+```
+
+### Progress via Task Object
+
+You can also get progress directly from the task object:
+
+```python
+task = train_model({"epochs": 100})
+
+# Get progress using task method
+progress = task.get_progress(mq.redis_client)
+if progress:
+    print(f"Progress: {progress['progress'] * 100:.1f}%")
+    print(f"Message: {progress['message']}")
+    print(f"Updated at: {progress['updated_at']}")
+```
+
+### Combining Progress with Cancellation
+
+```python
+@mq.task()
+def process_large_dataset(params: dict):
+    task_id = params.get("_task_id")
+    items = params.get("items", [])
+    total = len(items)
+    results = []
+
+    for i, item in enumerate(items):
+        # Check cancellation
+        if mq.is_task_cancelled(task_id):
+            mq.report_progress(task_id, i / total, "Cancelled by user")
+            return {"status": "cancelled", "processed": i}
+
+        # Report progress
+        mq.report_progress(task_id, i / total, f"Processing item {i + 1}/{total}")
+
+        # Process
+        results.append(process(item))
+
+    mq.report_progress(task_id, 1.0, "Completed")
+    return {"status": "completed", "results": results}
+```
+
+---
+
 ## 🛠️ Configuration
 
 Connect to Redis using custom config:
@@ -276,8 +444,37 @@ imagine_db = Redis(host="localhost", port=6379, db=0)
 modelq = ModelQ(
     redis_client=imagine_db,
     delay_seconds=10,  # delay between retries
-    webhook_url="https://your.error.receiver/discord-or-slack"
+    webhook_url="https://your.error.receiver/discord-or-slack",
+    task_history_retention=86400,  # task history retention in seconds (default: 24 hours)
+    task_ttl=86400,  # task TTL in seconds (default: 24 hours)
 )
+```
+
+### Configuration Options
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `redis_client` | Required | Redis client instance |
+| `delay_seconds` | `10` | Delay between task retries |
+| `webhook_url` | `None` | URL for error notifications (Discord/Slack) |
+| `task_history_retention` | `86400` (24h) | How long to keep task history in seconds |
+| `task_ttl` | `86400` (24h) | Task time-to-live in seconds |
+
+### Cleanup Expired Tasks
+
+Tasks older than the TTL can be cleaned up manually:
+
+```python
+# Remove expired tasks from the queue
+removed_count = mq.cleanup_expired_tasks()
+print(f"Removed {removed_count} expired tasks")
+
+# Clear old task history
+removed_count = mq.clear_task_history()  # Uses configured retention
+print(f"Cleared {removed_count} old history entries")
+
+# Or specify custom age in seconds
+removed_count = mq.clear_task_history(3600)  # Clear tasks older than 1 hour
 ```
 
 ---

@@ -440,3 +440,182 @@ def test_get_task_history_with_limit_and_offset(modelq_instance):
     page2 = modelq_instance.get_task_history(limit=3, offset=3)
     assert len(page2) == 3
     assert page2[0]["task_id"] == "page_6"
+
+
+# ---------------------------------------------------------------------------
+# Task Cancellation Tests
+# ---------------------------------------------------------------------------
+
+def test_cancel_task(modelq_instance):
+    """Test cancelling a task."""
+    task_data = {
+        "task_id": "cancel_test_1",
+        "task_name": "test_task",
+        "status": "queued",
+        "created_at": time.time()
+    }
+
+    # Store task
+    modelq_instance.redis_client.set(f"task:{task_data['task_id']}", json.dumps(task_data))
+    modelq_instance.redis_client.rpush("ml_tasks", json.dumps(task_data))
+    modelq_instance.redis_client.zadd("queued_requests", {task_data['task_id']: time.time()})
+
+    # Cancel the task
+    result = modelq_instance.cancel_task("cancel_test_1")
+    assert result is True
+
+    # Check cancellation flag is set
+    assert modelq_instance.is_task_cancelled("cancel_test_1") is True
+
+    # Check task status is updated
+    updated_task = json.loads(modelq_instance.redis_client.get("task:cancel_test_1"))
+    assert updated_task["status"] == "cancelled"
+
+
+def test_cancel_nonexistent_task(modelq_instance):
+    """Test cancelling a task that doesn't exist."""
+    result = modelq_instance.cancel_task("nonexistent_task_id")
+    assert result is False
+
+
+def test_is_task_cancelled(modelq_instance):
+    """Test checking if a task is cancelled."""
+    # Not cancelled
+    assert modelq_instance.is_task_cancelled("uncancelled_task") is False
+
+    # Set cancellation flag
+    modelq_instance.redis_client.set("task:cancelled_task:cancelled", "1")
+    assert modelq_instance.is_task_cancelled("cancelled_task") is True
+
+
+def test_get_cancelled_tasks(modelq_instance):
+    """Test getting list of cancelled tasks."""
+    now = time.time()
+    tasks = [
+        {"task_id": "cancelled_1", "task_name": "test", "status": "cancelled", "created_at": now - 100},
+        {"task_id": "cancelled_2", "task_name": "test", "status": "completed", "created_at": now - 50},
+        {"task_id": "cancelled_3", "task_name": "test", "status": "cancelled", "created_at": now},
+    ]
+
+    for task in tasks:
+        modelq_instance.redis_client.set(f"task_history:{task['task_id']}", json.dumps(task))
+        modelq_instance.redis_client.zadd("task_history", {task['task_id']: task['created_at']})
+
+    cancelled = modelq_instance.get_cancelled_tasks()
+    assert len(cancelled) == 2
+    assert all(t["status"] == "cancelled" for t in cancelled)
+
+
+# ---------------------------------------------------------------------------
+# Progress Tracking Tests
+# ---------------------------------------------------------------------------
+
+def test_report_progress(modelq_instance):
+    """Test reporting task progress."""
+    task_id = "progress_test_1"
+
+    # Report progress
+    modelq_instance.report_progress(task_id, 0.5, "Halfway done")
+
+    # Verify progress is stored
+    progress_data = modelq_instance.redis_client.get(f"task:{task_id}:progress")
+    assert progress_data is not None
+
+    progress = json.loads(progress_data)
+    assert progress["progress"] == 0.5
+    assert progress["message"] == "Halfway done"
+    assert "updated_at" in progress
+
+
+def test_report_progress_clamps_values(modelq_instance):
+    """Test that progress is clamped between 0 and 1."""
+    task_id = "progress_clamp_test"
+
+    # Test clamping above 1
+    modelq_instance.report_progress(task_id, 1.5, "Over 100%")
+    progress = json.loads(modelq_instance.redis_client.get(f"task:{task_id}:progress"))
+    assert progress["progress"] == 1.0
+
+    # Test clamping below 0
+    modelq_instance.report_progress(task_id, -0.5, "Negative")
+    progress = json.loads(modelq_instance.redis_client.get(f"task:{task_id}:progress"))
+    assert progress["progress"] == 0.0
+
+
+def test_get_task_progress(modelq_instance):
+    """Test getting task progress."""
+    task_id = "get_progress_test"
+
+    # No progress yet
+    assert modelq_instance.get_task_progress(task_id) is None
+
+    # Report progress
+    modelq_instance.report_progress(task_id, 0.75, "Almost done")
+
+    # Get progress
+    progress = modelq_instance.get_task_progress(task_id)
+    assert progress is not None
+    assert progress["progress"] == 0.75
+    assert progress["message"] == "Almost done"
+
+
+def test_report_progress_without_message(modelq_instance):
+    """Test reporting progress without a message."""
+    task_id = "progress_no_msg_test"
+
+    modelq_instance.report_progress(task_id, 0.25)
+
+    progress = modelq_instance.get_task_progress(task_id)
+    assert progress["progress"] == 0.25
+    assert progress["message"] is None
+
+
+# ---------------------------------------------------------------------------
+# Task TTL and Cleanup Tests
+# ---------------------------------------------------------------------------
+
+def test_cleanup_expired_tasks(modelq_instance):
+    """Test cleaning up expired tasks from queue."""
+    now = time.time()
+
+    # Create an old task (expired)
+    old_task = {
+        "task_id": "expired_task",
+        "task_name": "test",
+        "status": "queued",
+        "created_at": now - 100000  # Very old
+    }
+    modelq_instance.redis_client.rpush("ml_tasks", json.dumps(old_task))
+
+    # Create a fresh task
+    fresh_task = {
+        "task_id": "fresh_task",
+        "task_name": "test",
+        "status": "queued",
+        "created_at": now
+    }
+    modelq_instance.redis_client.rpush("ml_tasks", json.dumps(fresh_task))
+
+    # Cleanup expired tasks
+    removed = modelq_instance.cleanup_expired_tasks()
+    assert removed == 1
+
+    # Verify fresh task is still in queue
+    queued = modelq_instance.get_all_queued_tasks()
+    task_ids = [t["task_id"] for t in queued]
+    assert "fresh_task" in task_ids
+    assert "expired_task" not in task_ids
+
+
+def test_configurable_task_ttl(mock_redis):
+    """Test that task TTL is configurable."""
+    # Custom TTL of 1 hour
+    mq = ModelQ(redis_client=mock_redis, task_ttl=3600)
+    assert mq.task_ttl == 3600
+
+
+def test_configurable_history_retention(mock_redis):
+    """Test that history retention is configurable."""
+    # Custom retention of 1 hour
+    mq = ModelQ(redis_client=mock_redis, task_history_retention=3600)
+    assert mq.task_history_retention == 3600

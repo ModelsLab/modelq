@@ -32,7 +32,9 @@ class ModelQ:
     PRUNE_TIMEOUT = 300         # seconds: how long before a server is considered stale
     PRUNE_CHECK_INTERVAL = 60   # seconds: how often to check for stale servers
     TASK_RESULT_RETENTION = 86400
-    TASK_HISTORY_RETENTION = 604800  # 7 days in seconds
+    TASK_HISTORY_RETENTION = 86400   # 24 hours in seconds (configurable)
+    TASK_TTL = 86400                 # 24 hours TTL for all tasks
+    DEFAULT_STREAM_TIMEOUT = 300     # 5 minutes default stream timeout
 
     def __init__(
         self,
@@ -49,6 +51,8 @@ class ModelQ:
         webhook_url: Optional[str] = None,  # Optional webhook for error logging
         requeue_threshold : Optional[int] = None ,
         delay_seconds: int = 30,
+        task_history_retention: Optional[int] = None,  # Configurable history retention (default 24h)
+        task_ttl: Optional[int] = None,  # Configurable task TTL (default 24h)
         redis_retry_attempts: int = 5,
         redis_retry_base_delay: float = 0.5,
         redis_retry_backoff: float = 2.0,
@@ -87,6 +91,8 @@ class ModelQ:
         self.webhook_url = webhook_url
         self.requeue_threshold = requeue_threshold
         self.delay_seconds = delay_seconds
+        self.task_history_retention = task_history_retention or self.TASK_HISTORY_RETENTION
+        self.task_ttl = task_ttl or self.TASK_TTL
 
         # Register this server in Redis (with an initial heartbeat)
         self.register_server()
@@ -1055,11 +1061,11 @@ class ModelQ:
     def clear_task_history(self, older_than_seconds: int = None) -> int:
         """
         Clear old entries from task history.
-        Default is to clear entries older than TASK_HISTORY_RETENTION (7 days).
+        Default is to clear entries older than task_history_retention (24 hours by default).
         Returns the number of entries removed.
         """
         if older_than_seconds is None:
-            older_than_seconds = self.TASK_HISTORY_RETENTION
+            older_than_seconds = self.task_history_retention
 
         cutoff = time.time() - older_than_seconds
         removed = 0
@@ -1075,5 +1081,119 @@ class ModelQ:
 
         if removed > 0:
             logger.info(f"Cleared {removed} task(s) from history older than {older_than_seconds} seconds.")
+
+        return removed
+
+    # ============================================
+    # Task Cancellation Methods
+    # ============================================
+
+    def cancel_task(self, task_id: str) -> bool:
+        """
+        Cancel a task. Works for queued or processing tasks.
+        - If queued: removes from queue and marks as cancelled
+        - If processing: marks as cancelled (worker will check and stop)
+        Returns True if task was found and cancelled.
+        """
+        # Set cancellation flag
+        self.redis_client.set(f"task:{task_id}:cancelled", "1", ex=self.task_ttl)
+
+        # Try to remove from queue
+        removed_from_queue = self.remove_task_from_queue(task_id)
+
+        # Update task status
+        task_data = self.redis_client.get(f"task:{task_id}")
+        if task_data:
+            task_dict = json.loads(task_data)
+            task_dict["status"] = "cancelled"
+            task_dict["finished_at"] = time.time()
+            self.redis_client.set(f"task:{task_id}", json.dumps(task_dict), ex=self.task_ttl)
+            self._update_task_history(task_id, task_dict)
+            logger.info(f"Task {task_id} cancelled.")
+            return True
+
+        return removed_from_queue
+
+    def is_task_cancelled(self, task_id: str) -> bool:
+        """
+        Check if a task has been cancelled.
+        Workers should call this periodically during long-running tasks.
+        """
+        cancelled = self.redis_client.get(f"task:{task_id}:cancelled")
+        return cancelled is not None
+
+    def get_cancelled_tasks(self, limit: int = 100) -> list[Dict[str, Any]]:
+        """
+        Get tasks that have been cancelled.
+        """
+        return self.get_task_history(limit=limit, status="cancelled")
+
+    # ============================================
+    # Progress Tracking Methods
+    # ============================================
+
+    def report_progress(self, task_id: str, progress: float, message: str = None) -> None:
+        """
+        Report progress for a long-running task.
+
+        Args:
+            task_id: The task ID
+            progress: Progress value between 0.0 and 1.0 (0% to 100%)
+            message: Optional progress message
+        """
+        progress_data = {
+            "progress": min(max(progress, 0.0), 1.0),  # Clamp to 0-1
+            "message": message,
+            "updated_at": time.time(),
+        }
+        self.redis_client.set(
+            f"task:{task_id}:progress",
+            json.dumps(progress_data),
+            ex=self.task_ttl
+        )
+
+    def get_task_progress(self, task_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get the current progress of a task.
+
+        Returns dict with:
+            - progress: float between 0.0 and 1.0
+            - message: optional progress message
+            - updated_at: timestamp of last update
+        """
+        progress_data = self.redis_client.get(f"task:{task_id}:progress")
+        if progress_data:
+            return json.loads(progress_data)
+        return None
+
+    # ============================================
+    # Task TTL Validation
+    # ============================================
+
+    def cleanup_expired_tasks(self) -> int:
+        """
+        Remove tasks that have exceeded their TTL from the queue.
+        Returns the number of expired tasks removed.
+        """
+        removed = 0
+        cutoff = time.time() - self.task_ttl
+
+        # Check queued tasks
+        tasks_in_queue = self.redis_client.lrange("ml_tasks", 0, -1)
+        for task_json in tasks_in_queue:
+            try:
+                task_dict = json.loads(task_json)
+                created_at = task_dict.get("created_at", 0)
+                if created_at and created_at < cutoff:
+                    self.redis_client.lrem("ml_tasks", 1, task_json)
+                    task_id = task_dict.get("task_id")
+                    if task_id:
+                        task_dict["status"] = "expired"
+                        task_dict["finished_at"] = time.time()
+                        self._update_task_history(task_id, task_dict)
+                        logger.info(f"Removed expired task {task_id} from queue.")
+                    removed += 1
+            except Exception as e:
+                logger.error(f"Error checking task expiry: {e}")
 
         return removed

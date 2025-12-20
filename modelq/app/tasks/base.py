@@ -3,7 +3,7 @@ import time
 import json
 import redis
 import base64
-from typing import Any, Optional, Generator
+from typing import Any, Dict, Optional, Generator
 from modelq.exceptions import TaskTimeoutError, TaskProcessingError
 from PIL import Image, PngImagePlugin
 import io
@@ -77,44 +77,68 @@ class Task:
         except TypeError:
             return str(data)
 
-    def get_stream(self, redis_client: redis.Redis) -> Generator[Any, None, None]:
+    def get_stream(
+        self,
+        redis_client: redis.Redis,
+        timeout: int = 300
+    ) -> Generator[Any, None, None]:
         """
         Generator to yield results from a streaming task.
         Continuously reads from a Redis stream and stops when
-        the task is completed or failed.
+        the task is completed, failed, cancelled, or timeout is reached.
+
+        Args:
+            redis_client: Redis client instance
+            timeout: Maximum time to wait for stream in seconds (default 300s/5min)
         """
         stream_key = f"task_stream:{self.task_id}"
         last_id = "0"
         completed = False
+        start_time = time.time()
 
         while not completed:
+            # Check timeout
+            if time.time() - start_time > timeout:
+                raise TaskTimeoutError(self.task_id)
+
+            # Check if task was cancelled
+            if redis_client.get(f"task:{self.task_id}:cancelled"):
+                self.status = "cancelled"
+                return
+
             # block=1000 => block for up to 1s, count=10 => max 10 messages
             results = redis_client.xread({stream_key: last_id}, block=1000, count=10)
             if results:
                 for _, messages in results:
                     for message_id, message_data in messages:
-                        # print(message_data)
                         result = json.loads(message_data[b"result"].decode("utf-8"))
                         yield result
                         last_id = message_id
-                        # Append to combined_result
-                        self.combined_result += result
+                        # Append to combined_result (handle non-string types)
+                        if isinstance(result, str):
+                            self.combined_result += result
+                        else:
+                            self.combined_result += json.dumps(result)
 
             # Check if the task is finished or failed
             task_json = redis_client.get(f"task_result:{self.task_id}")
             if task_json:
                 task_data = json.loads(task_json)
-                if task_data.get("status") == "completed":
+                status = task_data.get("status")
+                if status == "completed":
                     completed = True
                     # Update local fields
                     self.status = "completed"
                     self.result = self.combined_result
-                elif task_data.get("status") == "failed":
+                elif status == "failed":
                     error_message = task_data.get("result", "Task failed without an error message")
                     raise TaskProcessingError(
                         task_data.get("task_name", self.task_name),
                         error_message
                     )
+                elif status == "cancelled":
+                    self.status = "cancelled"
+                    return
 
         return
 
@@ -127,7 +151,7 @@ class Task:
     ) -> Any:
         """
         Waits for the result of the task until the timeout.
-        Raises TaskProcessingError if the task failed,
+        Raises TaskProcessingError if the task failed or was cancelled,
         or TaskTimeoutError if it never completes within the timeout.
         Optionally validates/deserializes the result using a Pydantic model.
         """
@@ -136,6 +160,11 @@ class Task:
 
         start_time = time.time()
         while time.time() - start_time < timeout:
+            # Check if task was cancelled
+            if redis_client.get(f"task:{self.task_id}:cancelled"):
+                self.status = "cancelled"
+                raise TaskProcessingError(self.task_name, "Task was cancelled")
+
             task_json = redis_client.get(f"task_result:{self.task_id}")
             if task_json:
                 task_data = json.loads(task_json)
@@ -148,6 +177,8 @@ class Task:
                         task_data.get("task_name", self.task_name),
                         error_message
                     )
+                elif self.status == "cancelled":
+                    raise TaskProcessingError(self.task_name, "Task was cancelled")
                 elif self.status == "completed":
                     raw_result = self.result
 
@@ -183,3 +214,25 @@ class Task:
             time.sleep(1)
 
         raise TaskTimeoutError(self.task_id)
+
+    def get_progress(self, redis_client: redis.Redis) -> Optional[Dict[str, Any]]:
+        """
+        Get the current progress of this task.
+
+        Returns dict with:
+            - progress: float between 0.0 and 1.0
+            - message: optional progress message
+            - updated_at: timestamp of last update
+        Returns None if no progress has been reported.
+        """
+        progress_data = redis_client.get(f"task:{self.task_id}:progress")
+        if progress_data:
+            return json.loads(progress_data)
+        return None
+
+    def is_cancelled(self, redis_client: redis.Redis) -> bool:
+        """
+        Check if this task has been cancelled.
+        """
+        cancelled = redis_client.get(f"task:{self.task_id}:cancelled")
+        return cancelled is not None
