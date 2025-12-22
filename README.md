@@ -469,6 +469,104 @@ def process_large_dataset(params: dict):
 
 ---
 
+## 🖥️ Worker Info
+
+Get detailed information about registered workers including system resources (CPU, RAM, GPU). This is useful for monitoring your worker fleet and understanding resource utilization.
+
+### Getting All Workers
+
+```python
+from modelq import ModelQ
+from redis import Redis
+
+redis_client = Redis(host="localhost", port=6379, db=0)
+mq = ModelQ(redis_client=redis_client)
+
+# Get all registered workers
+workers = mq.get_workers()
+for worker_id, worker in workers.items():
+    print(f"Worker: {worker_id}")
+    print(f"  Status: {worker['status']}")
+    print(f"  Hostname: {worker['hostname']}")
+    print(f"  OS: {worker['os']}")
+    print(f"  Python: {worker['python_version']}")
+    
+    if worker['system_info']:
+        cpu = worker['system_info']['cpu']
+        ram = worker['system_info']['ram']
+        
+        print(f"  CPU: {cpu['cores_logical']} cores ({cpu['usage_percent']}% used)")
+        print(f"  RAM: {ram['total_gb']} GB ({ram['used_percent']}% used)")
+        
+        # GPU info (if available)
+        for gpu in worker['system_info']['gpu']:
+            print(f"  GPU: {gpu['name']} - {gpu['memory_total_gb']} GB")
+            print(f"       Utilization: {gpu['gpu_utilization_percent']}%")
+            print(f"       Memory: {gpu['memory_used_gb']}/{gpu['memory_total_gb']} GB")
+    
+    print(f"  Tasks: {', '.join(worker['allowed_tasks'])}")
+```
+
+### Getting a Specific Worker
+
+```python
+# Get a specific worker by ID
+worker = mq.get_worker('gpu-server-1')
+if worker:
+    print(f"Worker {worker['worker_id']} is {worker['status']}")
+    if worker['system_info']['gpu']:
+        gpu = worker['system_info']['gpu'][0]
+        print(f"GPU Memory Free: {gpu['memory_free_gb']} GB")
+```
+
+### Worker Info Fields
+
+Each worker includes the following information:
+
+| Field | Description |
+|-------|-------------|
+| `worker_id` | Unique worker identifier |
+| `status` | Current status (idle, busy) |
+| `allowed_tasks` | List of tasks this worker handles |
+| `last_heartbeat` | Unix timestamp of last heartbeat |
+| `hostname` | Worker hostname |
+| `os` | Operating system info |
+| `python_version` | Python version |
+| `system_info` | Detailed CPU, RAM, and GPU information |
+
+### System Info Structure
+
+The `system_info` field contains:
+
+```python
+{
+    "cpu": {
+        "cores_physical": 8,
+        "cores_logical": 16,
+        "usage_percent": 45.2,
+        "freq_mhz": 3200.0
+    },
+    "ram": {
+        "total_gb": 64.0,
+        "available_gb": 32.5,
+        "used_percent": 49.2
+    },
+    "gpu": [
+        {
+            "index": 0,
+            "name": "NVIDIA RTX 4090",
+            "memory_total_gb": 24.0,
+            "memory_used_gb": 8.5,
+            "memory_free_gb": 15.5,
+            "gpu_utilization_percent": 75,
+            "memory_utilization_percent": 35
+        }
+    ]
+}
+```
+
+---
+
 ## 🛠️ Configuration
 
 Connect to Redis using custom config:

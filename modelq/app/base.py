@@ -6,10 +6,72 @@ import time
 import uuid
 import logging
 import traceback
+import platform
 from typing import Optional, Dict, Any
 import socket
 
 import requests  # For sending error payloads to a webhook
+
+
+def get_system_info() -> Dict[str, Any]:
+    """
+    Collect system information including CPU, RAM, and GPU details.
+    Returns a dict with cpu, ram, and gpu information.
+    """
+    info: Dict[str, Any] = {
+        "cpu": {},
+        "ram": {},
+        "gpu": [],
+    }
+
+    # Try to get CPU and RAM info using psutil
+    try:
+        import psutil
+        info["cpu"] = {
+            "cores_physical": psutil.cpu_count(logical=False),
+            "cores_logical": psutil.cpu_count(logical=True),
+            "usage_percent": psutil.cpu_percent(interval=0.1),
+            "freq_mhz": psutil.cpu_freq().current if psutil.cpu_freq() else None,
+        }
+        mem = psutil.virtual_memory()
+        info["ram"] = {
+            "total_gb": round(mem.total / (1024**3), 2),
+            "available_gb": round(mem.available / (1024**3), 2),
+            "used_percent": mem.percent,
+        }
+    except ImportError:
+        logger.debug("psutil not installed, skipping CPU/RAM info")
+    except Exception as e:
+        logger.debug(f"Error getting CPU/RAM info: {e}")
+
+    # Try to get GPU info using pynvml (NVIDIA GPUs)
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        device_count = pynvml.nvmlDeviceGetCount()
+        for i in range(device_count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(i)
+            name = pynvml.nvmlDeviceGetName(handle)
+            if isinstance(name, bytes):
+                name = name.decode("utf-8")
+            mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            info["gpu"].append({
+                "index": i,
+                "name": name,
+                "memory_total_gb": round(mem_info.total / (1024**3), 2),
+                "memory_used_gb": round(mem_info.used / (1024**3), 2),
+                "memory_free_gb": round(mem_info.free / (1024**3), 2),
+                "gpu_utilization_percent": util.gpu,
+                "memory_utilization_percent": util.memory,
+            })
+        pynvml.nvmlShutdown()
+    except ImportError:
+        logger.debug("pynvml not installed, skipping GPU info")
+    except Exception as e:
+        logger.debug(f"Error getting GPU info: {e}")
+
+    return info
 
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError,RetryTaskException
@@ -128,12 +190,16 @@ class ModelQ:
     def register_server(self):
         """
         Registers this server in the 'servers' hash, including allowed tasks,
-        current status, and last_heartbeat timestamp.
+        current status, last_heartbeat timestamp, and system info.
         """
         server_data = {
             "allowed_tasks": list(self.allowed_tasks),
             "status": "idle",
             "last_heartbeat": time.time(),
+            "hostname": socket.gethostname(),
+            "os": f"{platform.system()} {platform.release()}",
+            "python_version": platform.python_version(),
+            "system_info": get_system_info(),
         }
         self.redis_client.hset("servers", self.server_id, json.dumps(server_data))
 
@@ -259,6 +325,74 @@ class ModelQ:
         """
         keys = self.redis_client.hkeys("servers")  # returns raw bytes for each key
         return [k.decode("utf-8") for k in keys]
+
+    def get_workers(self) -> Dict[str, Dict[str, Any]]:
+        """
+        Get all registered workers with their system info.
+
+        Returns a dict mapping worker_id to worker data including:
+            - worker_id: Unique worker identifier
+            - status: Current status (idle, busy)
+            - allowed_tasks: List of tasks this worker handles
+            - last_heartbeat: Unix timestamp of last heartbeat
+            - hostname: Worker hostname
+            - os: Operating system info
+            - python_version: Python version (for Python workers)
+            - system_info: CPU, RAM, GPU information
+        """
+        workers = {}
+        all_servers = self.redis_client.hgetall("servers")
+
+        for server_id_bytes, data_bytes in all_servers.items():
+            server_id = server_id_bytes.decode("utf-8") if isinstance(server_id_bytes, bytes) else server_id_bytes
+            try:
+                data = json.loads(data_bytes.decode("utf-8") if isinstance(data_bytes, bytes) else data_bytes)
+                workers[server_id] = {
+                    "worker_id": server_id,
+                    "status": data.get("status", "unknown"),
+                    "allowed_tasks": data.get("allowed_tasks", []),
+                    "last_heartbeat": data.get("last_heartbeat", None),
+                    "hostname": data.get("hostname", None),
+                    "os": data.get("os", None),
+                    "python_version": data.get("python_version", None),
+                    "php_version": data.get("php_version", None),
+                    "system_info": data.get("system_info", None),
+                }
+            except Exception as e:
+                logger.warning(f"Could not parse worker data for {server_id}: {e}")
+
+        return workers
+
+    def get_worker(self, worker_id: str) -> Optional[Dict[str, Any]]:
+        """
+        Get a specific worker's info by ID.
+
+        Args:
+            worker_id: The worker ID to look up
+
+        Returns:
+            Worker data dict or None if not found
+        """
+        data_bytes = self.redis_client.hget("servers", worker_id)
+        if not data_bytes:
+            return None
+
+        try:
+            data = json.loads(data_bytes.decode("utf-8") if isinstance(data_bytes, bytes) else data_bytes)
+            return {
+                "worker_id": worker_id,
+                "status": data.get("status", "unknown"),
+                "allowed_tasks": data.get("allowed_tasks", []),
+                "last_heartbeat": data.get("last_heartbeat", None),
+                "hostname": data.get("hostname", None),
+                "os": data.get("os", None),
+                "python_version": data.get("python_version", None),
+                "php_version": data.get("php_version", None),
+                "system_info": data.get("system_info", None),
+            }
+        except Exception as e:
+            logger.warning(f"Could not parse worker data for {worker_id}: {e}")
+            return None
 
     def heartbeat(self):
         """
