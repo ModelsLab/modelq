@@ -194,6 +194,42 @@ print(task.get_result(q.redis_client))
 
 ---
 
+## 🔑 Custom Task IDs
+
+By default, ModelQ generates a UUID for each task. You can provide your own task ID using the `_task_id` parameter to correlate tasks with your database records:
+
+```python
+from modelq import ModelQ
+from redis import Redis
+
+redis_client = Redis(host="localhost", port=6379, db=0)
+mq = ModelQ(redis_client=redis_client)
+
+@mq.task()
+def process_order(order_data: dict):
+    # Process the order...
+    return {"status": "completed"}
+
+mq.start_workers()
+
+# Use your database record ID as the task ID
+order_id = "order-12345"
+task = process_order({"item": "widget"}, _task_id=order_id)
+
+print(task.task_id)  # 'order-12345'
+
+# Later, retrieve the task using the same ID
+status = mq.get_task_status(order_id)
+details = mq.get_task_details(order_id)
+```
+
+This is useful when you want to:
+- Track tasks using your existing database primary keys
+- Easily correlate queue tasks with database records
+- Look up task status without storing the generated UUID
+
+---
+
 ## 🔢 Pydantic Support
 
 ModelQ supports **Pydantic models** as both input and output types for tasks. This allows automatic validation of input parameters and structured return values.

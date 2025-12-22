@@ -400,6 +400,9 @@ class ModelQ:
 
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
+                # Extract optional custom task_id from kwargs
+                custom_task_id = kwargs.pop('_task_id', None)
+
                 # ---------------------------  PRODUCER-SIDE VALIDATION
                 if schema is not None:                   # ▶ pydantic
                     try:
@@ -414,7 +417,7 @@ class ModelQ:
                             func.__name__, f"Input validation failed – {ve}"
                         )
                     payload_data = validated.model_dump(mode="json")  # zero-copy
-                    args, kwargs = (), {}          # we’ll carry payload in kwargs only
+                    args, kwargs = (), {}          # we'll carry payload in kwargs only
                 else:
                     payload_data = {"args": args, "kwargs": kwargs}
 
@@ -425,7 +428,7 @@ class ModelQ:
                     "retries": retries,
                 }
 
-                task = task_class(task_name=func.__name__, payload=payload)
+                task = task_class(task_name=func.__name__, payload=payload, task_id=custom_task_id)
                 if stream:
                     task.stream = True
 

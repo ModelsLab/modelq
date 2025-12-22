@@ -11,14 +11,14 @@ import copy
 from typing import Type
 
 class Task:
-    def __init__(self, task_name: str, payload: dict, timeout: int = 15):
-        self.task_id = str(uuid.uuid4())
+    def __init__(self, task_name: str, payload: dict, timeout: int = 15, task_id: Optional[str] = None):
+        self.task_id = task_id if task_id else str(uuid.uuid4())
         self.task_name = task_name
         self.payload = payload
         self.original_payload = copy.deepcopy(payload)
         self.status = "queued"
         self.result = None
-        
+
         # New timestamps:
         self.created_at = time.time()   # When Task object is instantiated
         self.queued_at = None          # When task is enqueued in Redis
