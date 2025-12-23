@@ -18,7 +18,8 @@ class Task:
         self.original_payload = copy.deepcopy(payload)
         self.status = "queued"
         self.result = None
-        
+        self.base64_output = None  # New field for storing compressed base64 outputs
+
         # New timestamps:
         self.created_at = time.time()   # When Task object is instantiated
         self.queued_at = None          # When task is enqueued in Redis
@@ -36,6 +37,7 @@ class Task:
             "payload": self.payload,
             "status": self.status,
             "result": self.result,
+            "base64_output": self.base64_output,
             "created_at": self.created_at,
             "queued_at": self.queued_at,
             "started_at": self.started_at,
@@ -49,6 +51,7 @@ class Task:
         task.task_id = data["task_id"]
         task.status = data["status"]
         task.result = data.get("result")
+        task.base64_output = data.get("base64_output")
 
         # Load timestamps if present
         task.created_at = data.get("created_at")

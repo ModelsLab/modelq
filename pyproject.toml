@@ -16,7 +16,17 @@ typer = "^0.16.0"
 fastapi = "^0.115.12"
 uvicorn = "^0.34.2"
 pydantic = "^2.11.5"
+pillow = "^10.0.0"
+requests = "^2.31.0"
+brotli = "^1.2.0"
+lz4 = "^4.4.5"
 
 [build-system]
 requires = ["poetry-core"]
 build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (<9.0)",
+    "fakeredis (>=2.33.0,<3.0.0)"
+]
