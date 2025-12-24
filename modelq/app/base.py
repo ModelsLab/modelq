@@ -536,6 +536,8 @@ class ModelQ:
             def wrapper(*args, **kwargs):
                 # Extract optional custom task_id from kwargs
                 custom_task_id = kwargs.pop('_task_id', None)
+                # Extract optional additional_params from kwargs
+                additional_params = kwargs.pop('additional_params', None)
 
                 # ---------------------------  PRODUCER-SIDE VALIDATION
                 if schema is not None:                   # ▶ pydantic
@@ -562,7 +564,7 @@ class ModelQ:
                     "retries": retries,
                 }
 
-                task = task_class(task_name=func.__name__, payload=payload, task_id=custom_task_id)
+                task = task_class(task_name=func.__name__, payload=payload, task_id=custom_task_id, additional_params=additional_params)
                 if stream:
                     task.stream = True
 

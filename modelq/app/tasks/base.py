@@ -11,7 +11,7 @@ import copy
 from typing import Type
 
 class Task:
-    def __init__(self, task_name: str, payload: dict, timeout: int = 15, task_id: Optional[str] = None):
+    def __init__(self, task_name: str, payload: dict, timeout: int = 15, task_id: Optional[str] = None, additional_params: Optional[Dict[str, Any]] = None):
         self.task_id = task_id if task_id else str(uuid.uuid4())
         self.task_name = task_name
         self.payload = payload
@@ -29,8 +29,11 @@ class Task:
         self.stream = False
         self.combined_result = ""
 
+        # Additional parameters that will be included in task response
+        self.additional_params = additional_params or {}
+
     def to_dict(self):
-        return {
+        base_dict = {
             "task_id": self.task_id,
             "task_name": self.task_name,
             "payload": self.payload,
@@ -42,10 +45,25 @@ class Task:
             "finished_at": self.finished_at,
             "stream": self.stream,
         }
+        # Add additional_params to the base response if they exist
+        if self.additional_params:
+            base_dict.update(self.additional_params)
+        return base_dict
 
     @staticmethod
     def from_dict(data: dict) -> "Task":
-        task = Task(task_name=data["task_name"], payload=data["payload"])
+        # Extract additional_params from data (any keys not in the standard set)
+        standard_keys = {
+            "task_id", "task_name", "payload", "status", "result",
+            "created_at", "queued_at", "started_at", "finished_at", "stream"
+        }
+        additional_params = {k: v for k, v in data.items() if k not in standard_keys}
+
+        task = Task(
+            task_name=data["task_name"],
+            payload=data["payload"],
+            additional_params=additional_params if additional_params else None
+        )
         task.task_id = data["task_id"]
         task.status = data["status"]
         task.result = data.get("result")

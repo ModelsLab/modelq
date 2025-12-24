@@ -619,3 +619,212 @@ def test_configurable_history_retention(mock_redis):
     # Custom retention of 1 hour
     mq = ModelQ(redis_client=mock_redis, task_history_retention=3600)
     assert mq.task_history_retention == 3600
+
+
+# ---------------------------------------------------------------------------
+# Additional Params Tests
+# ---------------------------------------------------------------------------
+
+def test_task_with_additional_params(modelq_instance):
+    """Test that tasks can include additional custom parameters."""
+
+    @modelq_instance.task()
+    def test_task_with_params(x, y):
+        return x + y
+
+    # Call task with additional_params
+    task = test_task_with_params(
+        5, 10,
+        additional_params={
+            "proxy_links": ["http://proxy1.example.com", "http://proxy2.example.com"],
+            "public_links": "http://public.example.com",
+            "custom_field": "custom_value"
+        }
+    )
+
+    # Verify task has additional_params
+    assert task.additional_params == {
+        "proxy_links": ["http://proxy1.example.com", "http://proxy2.example.com"],
+        "public_links": "http://public.example.com",
+        "custom_field": "custom_value"
+    }
+
+    # Verify to_dict includes additional_params at root level
+    task_dict = task.to_dict()
+    assert task_dict["proxy_links"] == ["http://proxy1.example.com", "http://proxy2.example.com"]
+    assert task_dict["public_links"] == "http://public.example.com"
+    assert task_dict["custom_field"] == "custom_value"
+
+    # Verify standard fields are still present
+    assert task_dict["task_id"] == task.task_id
+    assert task_dict["task_name"] == "test_task_with_params"
+    assert task_dict["status"] == "queued"
+
+
+def test_task_without_additional_params(modelq_instance):
+    """Test that tasks work normally without additional_params."""
+
+    @modelq_instance.task()
+    def test_task_no_params(x):
+        return x * 2
+
+    # Call task without additional_params
+    task = test_task_no_params(5)
+
+    # Verify task has empty additional_params
+    assert task.additional_params == {}
+
+    # Verify to_dict doesn't include extra fields
+    task_dict = task.to_dict()
+    assert "proxy_links" not in task_dict
+    assert "public_links" not in task_dict
+
+    # Verify standard fields are still present
+    assert task_dict["task_id"] == task.task_id
+    assert task_dict["task_name"] == "test_task_no_params"
+    assert task_dict["status"] == "queued"
+
+
+def test_task_additional_params_in_redis(modelq_instance):
+    """Test that additional_params are stored correctly in Redis."""
+
+    @modelq_instance.task()
+    def redis_task(value):
+        return value
+
+    # Create task with additional_params
+    task = redis_task(
+        "test",
+        additional_params={
+            "metadata": {"key": "value"},
+            "tags": ["tag1", "tag2"]
+        }
+    )
+
+    # Retrieve task from Redis
+    task_json = modelq_instance.redis_client.get(f"task:{task.task_id}")
+    assert task_json is not None
+
+    stored_task = _json_bytes_to_dict(task_json)
+
+    # Verify additional_params are stored
+    assert stored_task["metadata"] == {"key": "value"}
+    assert stored_task["tags"] == ["tag1", "tag2"]
+
+
+def test_task_from_dict_with_additional_params(modelq_instance):
+    """Test that Task.from_dict correctly restores additional_params."""
+    from modelq.app.tasks.base import Task
+
+    # Create a task dict with additional params
+    task_dict = {
+        "task_id": "test_123",
+        "task_name": "test_task",
+        "payload": {"data": {}},
+        "status": "queued",
+        "result": None,
+        "created_at": time.time(),
+        "queued_at": time.time(),
+        "started_at": None,
+        "finished_at": None,
+        "stream": False,
+        "proxy_links": ["http://proxy.example.com"],
+        "public_links": "http://public.example.com",
+        "custom_metadata": {"foo": "bar"}
+    }
+
+    # Restore task from dict
+    task = Task.from_dict(task_dict)
+
+    # Verify additional_params are restored
+    assert task.additional_params == {
+        "proxy_links": ["http://proxy.example.com"],
+        "public_links": "http://public.example.com",
+        "custom_metadata": {"foo": "bar"}
+    }
+
+    # Verify to_dict produces same output
+    restored_dict = task.to_dict()
+    assert restored_dict["proxy_links"] == ["http://proxy.example.com"]
+    assert restored_dict["public_links"] == "http://public.example.com"
+    assert restored_dict["custom_metadata"] == {"foo": "bar"}
+
+
+def test_task_additional_params_empty_dict(modelq_instance):
+    """Test that passing empty additional_params works correctly."""
+
+    @modelq_instance.task()
+    def empty_params_task(x):
+        return x
+
+    # Call with empty dict
+    task = empty_params_task(5, additional_params={})
+
+    assert task.additional_params == {}
+    task_dict = task.to_dict()
+
+    # Should only have standard fields
+    expected_keys = {
+        "task_id", "task_name", "payload", "status", "result",
+        "created_at", "queued_at", "started_at", "finished_at", "stream"
+    }
+    assert set(task_dict.keys()) == expected_keys
+
+
+def test_task_additional_params_with_pydantic(mock_redis):
+    """Test that additional_params work with Pydantic schema validation."""
+    from pydantic import BaseModel
+
+    class TaskInput(BaseModel):
+        name: str
+        value: int
+
+    mq = ModelQ(redis_client=mock_redis)
+
+    @mq.task(schema=TaskInput)
+    def pydantic_task(params):
+        return params.name
+
+    # Create task with Pydantic input and additional_params
+    task = pydantic_task(
+        TaskInput(name="test", value=42),
+        additional_params={
+            "request_id": "req_123",
+            "priority": "high"
+        }
+    )
+
+    assert task.additional_params == {
+        "request_id": "req_123",
+        "priority": "high"
+    }
+
+    task_dict = task.to_dict()
+    assert task_dict["request_id"] == "req_123"
+    assert task_dict["priority"] == "high"
+
+
+def test_get_task_details_with_additional_params(modelq_instance):
+    """Test that get_task_details returns additional_params."""
+    task_data = {
+        "task_id": "detail_with_params",
+        "task_name": "test_task",
+        "status": "queued",
+        "created_at": time.time(),
+        "proxy_links": ["http://proxy.example.com"],
+        "public_links": "http://public.example.com"
+    }
+
+    modelq_instance.redis_client.set(
+        "task_history:detail_with_params",
+        json.dumps(task_data)
+    )
+    modelq_instance.redis_client.zadd(
+        "task_history",
+        {"detail_with_params": task_data["created_at"]}
+    )
+
+    details = modelq_instance.get_task_details("detail_with_params")
+    assert details is not None
+    assert details["proxy_links"] == ["http://proxy.example.com"]
+    assert details["public_links"] == "http://public.example.com"
