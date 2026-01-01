@@ -828,3 +828,139 @@ def test_get_task_details_with_additional_params(modelq_instance):
     assert details is not None
     assert details["proxy_links"] == ["http://proxy.example.com"]
     assert details["public_links"] == "http://public.example.com"
+
+
+# ---------------------------------------------------------------------------
+# Worker Health Tests (inactive_if_worker_boot_fail)
+# ---------------------------------------------------------------------------
+
+def test_worker_health_initialization_default(mock_redis):
+    """Test that worker is healthy by default."""
+    mq = ModelQ(redis_client=mock_redis)
+    assert mq.worker_healthy is True
+    assert mq.inactive_if_worker_boot_fail is False
+
+
+def test_worker_health_initialization_with_flag(mock_redis):
+    """Test initialization with inactive_if_worker_boot_fail=True."""
+    mq = ModelQ(redis_client=mock_redis, inactive_if_worker_boot_fail=True)
+    assert mq.worker_healthy is True
+    assert mq.inactive_if_worker_boot_fail is True
+
+
+def test_worker_health_before_worker_boot_success(mock_redis):
+    """Test that worker remains healthy when before_worker_boot succeeds."""
+    from modelq.app.middleware import Middleware
+
+    class TestMiddleware(Middleware):
+        def before_worker_boot(self):
+            # Successful boot - no exception
+            pass
+
+    mq = ModelQ(redis_client=mock_redis, inactive_if_worker_boot_fail=True)
+    mq.middleware = TestMiddleware()
+
+    # Define a simple task
+    @mq.task()
+    def simple_task():
+        return "success"
+
+    # Verify worker is still healthy before starting
+    assert mq.worker_healthy is True
+
+
+def test_worker_health_before_worker_boot_failure(mock_redis):
+    """Test that worker becomes unhealthy when before_worker_boot fails."""
+    from modelq.app.middleware import Middleware
+
+    class FailingMiddleware(Middleware):
+        def before_worker_boot(self):
+            raise Exception("Boot failed!")
+
+    mq = ModelQ(redis_client=mock_redis, inactive_if_worker_boot_fail=True)
+    mq.middleware = FailingMiddleware()
+
+    # Define a simple task
+    @mq.task()
+    def simple_task():
+        return "success"
+
+    # Start workers - this should catch the exception and mark worker unhealthy
+    mq.start_workers(no_of_workers=1)
+
+    # Worker should be marked unhealthy
+    assert mq.worker_healthy is False
+
+
+def test_worker_health_disabled_flag(mock_redis):
+    """Test that worker stays healthy even when before_worker_boot fails if flag is False."""
+    from modelq.app.middleware import Middleware
+
+    class FailingMiddleware(Middleware):
+        def before_worker_boot(self):
+            raise Exception("Boot failed!")
+
+    # Create ModelQ without the flag (default behavior)
+    mq = ModelQ(redis_client=mock_redis, inactive_if_worker_boot_fail=False)
+    mq.middleware = FailingMiddleware()
+
+    # Define a simple task
+    @mq.task()
+    def simple_task():
+        return "success"
+
+    # Start workers - exception should propagate normally
+    try:
+        mq.start_workers(no_of_workers=1)
+    except Exception:
+        pass  # Exception is expected in original behavior
+
+    # Worker should still be healthy (flag is disabled)
+    assert mq.worker_healthy is True
+
+
+def test_worker_health_no_middleware(mock_redis):
+    """Test that worker stays healthy when no middleware is set."""
+    mq = ModelQ(redis_client=mock_redis, inactive_if_worker_boot_fail=True)
+
+    # Define a simple task
+    @mq.task()
+    def simple_task():
+        return "success"
+
+    # Start workers without middleware
+    mq.start_workers(no_of_workers=1)
+
+    # Worker should remain healthy
+    assert mq.worker_healthy is True
+
+
+def test_worker_health_task_pickup_blocked(mock_redis):
+    """Test that unhealthy workers don't pick up tasks."""
+    from modelq.app.middleware import Middleware
+
+    class FailingMiddleware(Middleware):
+        def before_worker_boot(self):
+            raise Exception("Boot failed!")
+
+    mq = ModelQ(redis_client=mock_redis, inactive_if_worker_boot_fail=True)
+    mq.middleware = FailingMiddleware()
+
+    # Define a task
+    @mq.task()
+    def test_task():
+        return "completed"
+
+    # Enqueue a task
+    task = test_task()
+
+    # Start workers - should fail and mark unhealthy
+    mq.start_workers(no_of_workers=1)
+
+    # Worker should be unhealthy
+    assert mq.worker_healthy is False
+
+    # Task should remain in queue (worker won't pick it up)
+    queued_tasks = mq.get_all_queued_tasks()
+    assert len(queued_tasks) == 1
+    assert queued_tasks[0]["task_id"] == task.task_id

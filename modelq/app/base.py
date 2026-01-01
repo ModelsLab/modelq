@@ -119,6 +119,7 @@ class ModelQ:
         redis_retry_base_delay: float = 0.5,
         redis_retry_backoff: float = 2.0,
         redis_retry_jitter: float = 0.3,
+        inactive_if_worker_boot_fail: bool = False,  # Mark worker as unhealthy if before_worker_boot fails
         **kwargs,
     ):
         if redis_client:
@@ -155,6 +156,8 @@ class ModelQ:
         self.delay_seconds = delay_seconds
         self.task_history_retention = task_history_retention or self.TASK_HISTORY_RETENTION
         self.task_ttl = task_ttl or self.TASK_TTL
+        self.inactive_if_worker_boot_fail = inactive_if_worker_boot_fail
+        self.worker_healthy = True  # Track worker health status
 
         # Register this server in Redis (with an initial heartbeat)
         self.register_server()
@@ -596,7 +599,16 @@ class ModelQ:
         if any(thread.is_alive() for thread in self.worker_threads):
             return
 
-        self.check_middleware("before_worker_boot")
+        # Execute before_worker_boot middleware and track health
+        if self.inactive_if_worker_boot_fail and self.middleware:
+            try:
+                self.check_middleware("before_worker_boot")
+            except Exception as e:
+                logger.error(f"before_worker_boot middleware failed: {e}")
+                self.worker_healthy = False
+                logger.warning("Worker marked as unhealthy. Tasks will not be picked up.")
+        else:
+            self.check_middleware("before_worker_boot")
 
         # 1) Delayed re-queue thread
         requeue_thread = threading.Thread(target=self.requeue_delayed_tasks, daemon=True)
@@ -618,6 +630,12 @@ class ModelQ:
             self.check_middleware("after_worker_boot")
             while True:
                 try:
+                    # Check worker health before picking up tasks
+                    if not self.worker_healthy:
+                        logger.warning(f"Worker {worker_id} is unhealthy. Not picking up tasks.")
+                        time.sleep(5)  # Wait before checking again
+                        continue
+
                     self.update_server_status(f"worker_{worker_id}: idle")
                     task_data = self.redis_client.blpop("ml_tasks")  # blocks until a task is available
                     if not task_data:
