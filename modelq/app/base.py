@@ -77,6 +77,13 @@ from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError,RetryTaskException
 from modelq.app.middleware import Middleware
 from modelq.app.redis_retry import _RedisWithRetry
+from modelq.app.sentry import (
+    is_sentry_available,
+    init_sentry,
+    capture_task_exception,
+    add_breadcrumb,
+    flush_sentry,
+)
 
 from pydantic import BaseModel, ValidationError 
 from typing import Optional, Dict, Any, Type 
@@ -120,6 +127,14 @@ class ModelQ:
         redis_retry_backoff: float = 2.0,
         redis_retry_jitter: float = 0.3,
         inactive_if_worker_boot_fail: bool = False,  # Mark worker as unhealthy if before_worker_boot fails
+        # Sentry integration (optional)
+        sentry_dsn: Optional[str] = None,
+        sentry_traces_sample_rate: float = 0.0,
+        sentry_profiles_sample_rate: float = 0.0,
+        sentry_environment: Optional[str] = None,
+        sentry_release: Optional[str] = None,
+        sentry_send_default_pii: bool = False,
+        sentry_debug: bool = False,
         **kwargs,
     ):
         if redis_client:
@@ -158,6 +173,22 @@ class ModelQ:
         self.task_ttl = task_ttl or self.TASK_TTL
         self.inactive_if_worker_boot_fail = inactive_if_worker_boot_fail
         self.worker_healthy = True  # Track worker health status
+
+        # Initialize Sentry if DSN is provided (optional)
+        self.sentry_enabled = False
+        if sentry_dsn:
+            self.sentry_enabled = init_sentry(
+                dsn=sentry_dsn,
+                traces_sample_rate=sentry_traces_sample_rate,
+                profiles_sample_rate=sentry_profiles_sample_rate,
+                environment=sentry_environment,
+                release=sentry_release,
+                server_name=self.server_id,
+                send_default_pii=sentry_send_default_pii,
+                debug=sentry_debug,
+            )
+            if self.sentry_enabled:
+                logger.info("Sentry integration enabled for ModelQ")
 
         # Register this server in Redis (with an initial heartbeat)
         self.register_server()
@@ -664,6 +695,16 @@ class ModelQ:
                     if task.task_name in self.allowed_tasks:
                         try:
                             logger.info(f"Worker {worker_id} started processing: {task.task_name}")
+
+                            # Add Sentry breadcrumb for task processing
+                            if self.sentry_enabled:
+                                add_breadcrumb(
+                                    message=f"Processing task: {task.task_name}",
+                                    category="task",
+                                    level="info",
+                                    data={"task_id": task.task_id, "worker_id": worker_id},
+                                )
+
                             start_time = time.time()
                             self.process_task(task)
                             end_time = time.time()
@@ -704,6 +745,9 @@ class ModelQ:
                     )
                 finally:
                     self.check_middleware("before_worker_shutdown")
+                    # Flush Sentry events before worker shutdown
+                    if self.sentry_enabled:
+                        flush_sentry(timeout=2.0)
                     self.check_middleware("after_worker_shutdown")
 
         for i in range(no_of_workers):
@@ -870,6 +914,26 @@ class ModelQ:
 
             # 2) Webhook (if configured)
             self.post_error_to_webhook(task, e)
+
+            # 3) Sentry (if enabled) - capture with full traceback
+            if self.sentry_enabled:
+                import sys
+                event_id = capture_task_exception(
+                    exc=e,
+                    task_id=task.task_id,
+                    task_name=task.task_name,
+                    payload=task.payload,
+                    worker_id=self.server_id,
+                    additional_context={
+                        "created_at": task.created_at,
+                        "started_at": task.started_at,
+                        "additional_params": task.additional_params,
+                    },
+                    exc_info=sys.exc_info(),  # Pass full traceback with line numbers
+                )
+                if event_id:
+                    logger.info(f"Error reported to Sentry: {event_id}")
+
             logger.error(f"Task {task.task_name} failed with error: {e}")
             raise TaskProcessingError(task.task_name, str(e))
 
