@@ -122,10 +122,6 @@ class ModelQ:
         delay_seconds: int = 30,
         task_history_retention: Optional[int] = None,  # Configurable history retention (default 24h)
         task_ttl: Optional[int] = None,  # Configurable task TTL (default 24h)
-        redis_retry_attempts: int = 5,
-        redis_retry_base_delay: float = 0.5,
-        redis_retry_backoff: float = 2.0,
-        redis_retry_jitter: float = 0.3,
         inactive_if_worker_boot_fail: bool = False,  # Mark worker as unhealthy if before_worker_boot fails
         # Sentry integration (optional)
         sentry_dsn: Optional[str] = None,
@@ -138,13 +134,7 @@ class ModelQ:
         **kwargs,
     ):
         if redis_client:
-            self.redis_client = _RedisWithRetry(
-                redis_client,
-                max_attempts=redis_retry_attempts,
-                base_delay=redis_retry_base_delay,
-                backoff=redis_retry_backoff,
-                jitter=redis_retry_jitter,
-            )
+            self.redis_client = _RedisWithRetry(redis_client)
 
         else:
             self.redis_client = self._connect_to_redis(
