@@ -131,6 +131,7 @@ class ModelQ:
         sentry_release: Optional[str] = None,
         sentry_send_default_pii: bool = False,
         sentry_debug: bool = False,
+        silent: bool = False,
         **kwargs,
     ):
         if redis_client:
@@ -163,6 +164,11 @@ class ModelQ:
         self.task_ttl = task_ttl or self.TASK_TTL
         self.inactive_if_worker_boot_fail = inactive_if_worker_boot_fail
         self.worker_healthy = True  # Track worker health status
+
+        # Silent mode: suppress all modelq logging output
+        if silent:
+            logging.getLogger("modelq").setLevel(logging.CRITICAL + 1)
+            logger.setLevel(logging.CRITICAL + 1)
 
         # Initialize Sentry if DSN is provided (optional)
         self.sentry_enabled = False
