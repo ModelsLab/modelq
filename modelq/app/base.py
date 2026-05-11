@@ -278,20 +278,24 @@ class ModelQ:
                 continue
 
             task_dict = json.loads(task_data)
-            # Fall back to queued_at when started_at is missing — covers workers
-            # that crashed in the SADD→SET window before started_at was persisted.
-            reference = task_dict.get("started_at") or task_dict.get("queued_at")
-            if reference and (now - reference) > threshold:
-                logger.info(
-                    f"Re-queuing stuck task {task_id} (age {now - reference:.2f}s)."
-                )
-                task_dict["status"] = "queued"
-                task_dict["queued_at"] = now
-                task_dict["started_at"] = None
-
-                self.redis_client.set(f"task:{task_id}", json.dumps(task_dict), ex=86400)
-                self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
-                self.redis_client.srem("processing_tasks", task_id)
+            started_at = task_dict.get("started_at", 0)
+            if started_at:
+                if now - started_at > threshold:
+                    logger.info(
+                        f"Re-queuing stuck task {task_id} which has been 'processing' for {now - started_at:.2f} seconds."
+                    )
+                    # Update status, queued_at, etc.
+                    task_dict["status"] = "queued"
+                    task_dict["queued_at"] = now
+    
+                    # Store the updated dict back in Redis
+                    self.redis_client.set(f"task:{task_id}", json.dumps(task_dict),ex=86400)
+                    
+                    # Push it back into ml_tasks
+                    self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
+    
+                    # Remove from processing set
+                    self.redis_client.srem("processing_tasks", task_id)
 
     def prune_old_task_results(self, older_than_seconds: int = None):
         """
@@ -669,20 +673,20 @@ class ModelQ:
                     task_dict = json.loads(task_json)
                     task = Task.from_dict(task_dict)
 
+                    # Mark task as 'processing'
                     added = self.redis_client.sadd("processing_tasks", task.task_id)
                     if added == 0:
                         logger.warning(
                             f"Task {task.task_id} is already being processed. Skipping duplicate."
                         )
                         continue
-
-                    now_ts = time.time()
                     task.status = "processing"
-                    task.started_at = now_ts
-                    task_dict["status"] = "processing"
-                    task_dict["started_at"] = now_ts
 
-                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict), ex=86400)
+                    # Set started_at
+                    task_dict["started_at"] = time.time()
+
+                    # Update in Redis
+                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict),ex=86400)
 
                     if task.task_name in self.allowed_tasks:
                         try:
@@ -963,8 +967,6 @@ class ModelQ:
             json.dumps(task_dict),
             ex=86400
         )
-
-        self.redis_client.zrem("queued_requests", task.task_id)
 
         # Update task history
         self._update_task_history(task.task_id, task_dict)
