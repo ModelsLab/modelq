@@ -131,6 +131,7 @@ class ModelQ:
         sentry_release: Optional[str] = None,
         sentry_send_default_pii: bool = False,
         sentry_debug: bool = False,
+        sentry_ignore_exceptions: Optional[Any] = None,
         silent: bool = False,
         **kwargs,
     ):
@@ -164,6 +165,9 @@ class ModelQ:
         self.task_ttl = task_ttl or self.TASK_TTL
         self.inactive_if_worker_boot_fail = inactive_if_worker_boot_fail
         self.worker_healthy = True  # Track worker health status
+        self.sentry_ignore_exceptions = self._normalize_sentry_ignore_exceptions(
+            sentry_ignore_exceptions
+        )
 
         # Silent mode: suppress all modelq logging output
         if silent:
@@ -182,12 +186,49 @@ class ModelQ:
                 server_name=self.server_id,
                 send_default_pii=sentry_send_default_pii,
                 debug=sentry_debug,
+                ignore_errors=self.sentry_ignore_exceptions or None,
             )
             if self.sentry_enabled:
                 logger.info("Sentry integration enabled for ModelQ")
 
         # Register this server in Redis (with an initial heartbeat)
         self.register_server()
+
+    @staticmethod
+    def _normalize_sentry_ignore_exceptions(ignore_exceptions: Optional[Any]) -> tuple:
+        """
+        Normalize Sentry ignored exception configuration to a tuple of exception types.
+
+        Accepts a single exception class or an iterable of exception classes.
+        """
+        if ignore_exceptions is None:
+            return ()
+
+        if isinstance(ignore_exceptions, type):
+            ignore_exceptions = (ignore_exceptions,)
+        else:
+            ignore_exceptions = tuple(ignore_exceptions)
+
+        invalid = [
+            exc_type
+            for exc_type in ignore_exceptions
+            if not isinstance(exc_type, type) or not issubclass(exc_type, BaseException)
+        ]
+        if invalid:
+            raise TypeError(
+                "sentry_ignore_exceptions must contain exception classes, "
+                f"got invalid values: {invalid}"
+            )
+
+        return ignore_exceptions
+
+    def _should_ignore_sentry_exception(self, exc: Exception) -> bool:
+        """Return True when an exception should fail normally but not report to Sentry."""
+        return (
+            exc is not None
+            and bool(self.sentry_ignore_exceptions)
+            and isinstance(exc, self.sentry_ignore_exceptions)
+        )
 
     def _connect_to_redis(
         self,
@@ -723,9 +764,16 @@ class ModelQ:
                             )
 
                         except TaskProcessingError as e:
-                            logger.error(
-                                f"Worker {worker_id} encountered a TaskProcessingError: {e}"
-                            )
+                            if self._should_ignore_sentry_exception(e.__cause__):
+                                logger.warning(
+                                    "Worker %s encountered an ignored Sentry TaskProcessingError: %s",
+                                    worker_id,
+                                    e,
+                                )
+                            else:
+                                logger.error(
+                                    f"Worker {worker_id} encountered a TaskProcessingError: {e}"
+                                )
                             if task.payload.get("retries", 0) > 0:
                                 new_task_dict = task.to_dict()
                                 new_task_dict["payload"] = task.original_payload
@@ -926,27 +974,41 @@ class ModelQ:
             # 2) Webhook (if configured)
             self.post_error_to_webhook(task, e)
 
-            # 3) Sentry (if enabled) - capture with full traceback
+            # 3) Sentry (if enabled) - capture with full traceback unless ignored
             if self.sentry_enabled:
-                import sys
-                event_id = capture_task_exception(
-                    exc=e,
-                    task_id=task.task_id,
-                    task_name=task.task_name,
-                    payload=task.payload,
-                    worker_id=self.server_id,
-                    additional_context={
-                        "created_at": task.created_at,
-                        "started_at": task.started_at,
-                        "additional_params": task.additional_params,
-                    },
-                    exc_info=sys.exc_info(),  # Pass full traceback with line numbers
-                )
-                if event_id:
-                    logger.info(f"Error reported to Sentry: {event_id}")
+                if self._should_ignore_sentry_exception(e):
+                    logger.info(
+                        "Skipping Sentry capture for ignored exception %s in task %s",
+                        type(e).__name__,
+                        task.task_name,
+                    )
+                else:
+                    import sys
+                    event_id = capture_task_exception(
+                        exc=e,
+                        task_id=task.task_id,
+                        task_name=task.task_name,
+                        payload=task.payload,
+                        worker_id=self.server_id,
+                        additional_context={
+                            "created_at": task.created_at,
+                            "started_at": task.started_at,
+                            "additional_params": task.additional_params,
+                        },
+                        exc_info=sys.exc_info(),  # Pass full traceback with line numbers
+                    )
+                    if event_id:
+                        logger.info(f"Error reported to Sentry: {event_id}")
 
-            logger.error(f"Task {task.task_name} failed with error: {e}")
-            raise TaskProcessingError(task.task_name, str(e))
+            if self._should_ignore_sentry_exception(e):
+                logger.warning(
+                    "Task %s failed with ignored Sentry exception: %s",
+                    task.task_name,
+                    e,
+                )
+            else:
+                logger.error(f"Task {task.task_name} failed with error: {e}")
+            raise TaskProcessingError(task.task_name, str(e)) from e
 
         finally:
             self.redis_client.srem("processing_tasks", task.task_id)
