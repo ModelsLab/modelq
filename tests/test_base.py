@@ -935,6 +935,89 @@ def test_worker_health_no_middleware(mock_redis):
     assert mq.worker_healthy is True
 
 
+def test_modelq_reports_unignored_task_exceptions_to_sentry(mock_redis, monkeypatch):
+    """Task errors are reported to Sentry by default when Sentry is enabled."""
+    from modelq.app.tasks import Task
+    from modelq.exceptions import TaskProcessingError
+
+    class ExpectedUserError(Exception):
+        pass
+
+    captured = []
+
+    def fake_capture_task_exception(**kwargs):
+        captured.append(kwargs)
+        return "event-id"
+
+    monkeypatch.setattr(
+        "modelq.app.base.capture_task_exception",
+        fake_capture_task_exception,
+    )
+
+    mq = ModelQ(redis_client=mock_redis)
+    mq.sentry_enabled = True
+
+    @mq.task()
+    def failing_task():
+        raise ExpectedUserError("face not detected")
+
+    task = Task(
+        task_name="failing_task",
+        payload={"data": {"args": (), "kwargs": {}}, "timeout": None, "stream": False, "retries": 0},
+        task_id="reported-error",
+    )
+
+    with pytest.raises(TaskProcessingError):
+        mq.process_task(task)
+
+    assert len(captured) == 1
+    assert isinstance(captured[0]["exc"], ExpectedUserError)
+
+
+def test_modelq_raises_but_does_not_report_ignored_task_exceptions_to_sentry(mock_redis, monkeypatch):
+    """Ignored task exceptions still fail the task but are not captured by Sentry."""
+    from modelq.app.tasks import Task
+    from modelq.exceptions import TaskProcessingError
+
+    class ExpectedUserError(Exception):
+        pass
+
+    captured = []
+
+    def fake_capture_task_exception(**kwargs):
+        captured.append(kwargs)
+        return "event-id"
+
+    monkeypatch.setattr(
+        "modelq.app.base.capture_task_exception",
+        fake_capture_task_exception,
+    )
+
+    mq = ModelQ(
+        redis_client=mock_redis,
+        sentry_ignore_exceptions=[ExpectedUserError],
+    )
+    mq.sentry_enabled = True
+
+    @mq.task()
+    def ignored_failing_task():
+        raise ExpectedUserError("face not detected")
+
+    task = Task(
+        task_name="ignored_failing_task",
+        payload={"data": {"args": (), "kwargs": {}}, "timeout": None, "stream": False, "retries": 0},
+        task_id="ignored-error",
+    )
+
+    with pytest.raises(TaskProcessingError):
+        mq.process_task(task)
+
+    assert captured == []
+    stored = _json_bytes_to_dict(mock_redis.get("task:ignored-error"))
+    assert stored["status"] == "failed"
+    assert stored["error"]["type"] == "ExpectedUserError"
+
+
 def test_worker_health_task_pickup_blocked(mock_redis):
     """Test that unhealthy workers don't pick up tasks."""
     from modelq.app.middleware import Middleware
