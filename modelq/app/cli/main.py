@@ -93,7 +93,11 @@ def run_workers(
         raise typer.Exit(1)
     finally:
         logger.info("Shutting down workers...")
-        typer.echo("🛑 Shutting down workers...")
+        typer.echo("🛑 Draining workers (finishing any in-flight task)...")
+        try:
+            app_instance.shutdown()
+        except Exception as e:
+            logger.warning(f"Error while draining workers: {e}")
         typer.echo("✅ Shutdown complete")
 
 @app.command()
