@@ -1047,3 +1047,97 @@ def test_worker_health_task_pickup_blocked(mock_redis):
     queued_tasks = mq.get_all_queued_tasks()
     assert len(queued_tasks) == 1
     assert queued_tasks[0]["task_id"] == task.task_id
+
+
+# ---------------------------------------------------------------------------
+# prune_old_task_results: healthy keys must never be read
+# ---------------------------------------------------------------------------
+
+class _CountingRedis:
+    """Wraps a redis client and counts value reads, pipelined ones included."""
+
+    def __init__(self, inner):
+        self._inner = inner
+        self.get_calls = 0
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get(self, *a, **kw):
+        self.get_calls += 1
+        return self._inner.get(*a, **kw)
+
+    def pipeline(self, *a, **kw):
+        return _CountingPipeline(self._inner.pipeline(*a, **kw), self)
+
+
+class _CountingPipeline:
+    def __init__(self, inner, parent):
+        self._inner = inner
+        self._parent = parent
+
+    def __getattr__(self, name):
+        return getattr(self._inner, name)
+
+    def get(self, *a, **kw):
+        self._parent.get_calls += 1
+        return self._inner.get(*a, **kw)
+
+
+def test_prune_does_not_read_keys_that_have_a_ttl(modelq_instance):
+    """The control case: a keyspace of healthy keys costs zero value reads.
+
+    This is the whole point of the rewrite. The old implementation GET every
+    key on every pass; production showed 228.8M GETs to issue 2 deletes.
+    """
+    raw = modelq_instance.redis_client
+    for i in range(50):
+        raw.set(f"task_result:h{i}", json.dumps({"finished_at": time.time()}), ex=3600)
+
+    counting = _CountingRedis(raw)
+    modelq_instance.redis_client = counting
+    pruned = modelq_instance.prune_old_task_results(older_than_seconds=86_400)
+
+    assert pruned == 0
+    assert counting.get_calls == 0, "healthy keys must never have their value read"
+    for i in range(50):
+        assert raw.get(f"task_result:h{i}") is not None
+        assert raw.ttl(f"task_result:h{i}") > 0
+
+
+def test_prune_reads_only_the_key_that_lost_its_ttl(modelq_instance):
+    """One broken key among many healthy ones costs exactly one read."""
+    raw = modelq_instance.redis_client
+    for i in range(50):
+        raw.set(f"task_result:h{i}", json.dumps({"finished_at": time.time()}), ex=3600)
+    raw.set("task_result:leaked", json.dumps({"finished_at": time.time() - 90_000}))
+
+    counting = _CountingRedis(raw)
+    modelq_instance.redis_client = counting
+    pruned = modelq_instance.prune_old_task_results(older_than_seconds=86_400)
+
+    assert pruned == 1
+    assert counting.get_calls == 1, "only the TTL-less key should be read"
+    assert raw.get("task_result:leaked") is None
+
+
+def test_prune_bounds_a_recent_orphan_instead_of_deleting_it(modelq_instance):
+    """A key with no TTL but not yet old is kept, and stops living forever."""
+    raw = modelq_instance.redis_client
+    raw.set("task_result:fresh", json.dumps({"finished_at": time.time()}))
+    assert raw.ttl("task_result:fresh") == -1
+
+    pruned = modelq_instance.prune_old_task_results(older_than_seconds=86_400)
+
+    assert pruned == 0
+    assert raw.get("task_result:fresh") is not None
+    assert raw.ttl("task_result:fresh") > 0
+
+
+def test_pruning_loop_does_not_scan_task_results(modelq_instance):
+    """The 60s loop must not call the scan; Redis TTLs handle expiry."""
+    import inspect
+
+    src = inspect.getsource(type(modelq_instance)._pruning_loop)
+    body = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert "prune_old_task_results" not in body
