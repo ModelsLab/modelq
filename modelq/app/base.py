@@ -1,5 +1,6 @@
 import redis
 import json
+import contextlib
 import functools
 import threading
 import time
@@ -11,6 +12,28 @@ from typing import Optional, Dict, Any
 import socket
 
 import requests  # For sending error payloads to a webhook
+
+
+def _tcp_keepalive_options() -> Dict[int, int]:
+    """TCP keepalive tuning, restricted to what the running platform supports.
+
+    Linux exposes all three knobs. macOS spells the idle timer TCP_KEEPALIVE and
+    has no TCP_KEEPCNT, so we probe each name instead of assuming. An empty dict
+    is a valid result: keepalive still runs, just with the OS defaults (2h idle
+    on Linux), which is far too slow to be useful but never harmful.
+    """
+    wanted = (
+        ("TCP_KEEPIDLE", 60),   # start probing after 60s idle
+        ("TCP_KEEPALIVE", 60),  # macOS name for the same timer
+        ("TCP_KEEPINTVL", 10),  # probe every 10s
+        ("TCP_KEEPCNT", 3),     # give up after 3 failed probes (~90s total)
+    )
+    options: Dict[int, int] = {}
+    for name, value in wanted:
+        opt = getattr(socket, name, None)
+        if opt is not None:
+            options[opt] = value
+    return options
 
 
 def get_system_info() -> Dict[str, Any]:
@@ -104,6 +127,16 @@ class ModelQ:
     TASK_HISTORY_RETENTION = 86400   # 24 hours in seconds (configurable)
     TASK_TTL = 86400                 # 24 hours TTL for all tasks
     DEFAULT_STREAM_TIMEOUT = 300     # 5 minutes default stream timeout
+
+    # --- connection liveness -------------------------------------------------
+    # BLPOP_TIMEOUT must stay comfortably below SOCKET_TIMEOUT: redis-py applies
+    # the socket read timeout to blocking commands too, so a BLPOP that blocks
+    # longer than the socket allows would raise on every idle poll.
+    BLPOP_TIMEOUT = 15          # seconds: bound each queue read so a dead socket surfaces
+    SOCKET_TIMEOUT = 60         # seconds: hard ceiling on any single read
+    SOCKET_CONNECT_TIMEOUT = 10  # seconds: fail fast when the host is unreachable
+    HEALTH_CHECK_INTERVAL = 30  # seconds: PING a pooled connection idle this long
+    BACKGROUND_LOOP_BACKOFF = 5  # seconds: pause before retrying a crashed loop body
 
     def __init__(
         self,
@@ -252,6 +285,20 @@ class ModelQ:
             # ssl=ssl,
             # ssl_cert_reqs=ssl_cert_reqs,
             max_connections=max_connections,
+            # --- half-open connection detection -------------------------------
+            # Without these a silently dropped TCP connection is invisible to us.
+            # A reader parked in BLPOP transmits nothing, so the kernel never
+            # retransmits, never gives up, and never raises: the worker waits
+            # forever on a socket the server has already forgotten. Keepalive
+            # makes the kernel probe an idle connection; health_check_interval
+            # makes redis-py PING a pooled connection that has been idle before
+            # handing it out; socket_timeout bounds every read.
+            socket_keepalive=True,
+            socket_keepalive_options=_tcp_keepalive_options(),
+            socket_timeout=self.SOCKET_TIMEOUT,
+            socket_connect_timeout=self.SOCKET_CONNECT_TIMEOUT,
+            health_check_interval=self.HEALTH_CHECK_INTERVAL,
+            retry_on_timeout=True,
         )
         return redis.Redis(connection_pool=pool)
 
@@ -546,16 +593,17 @@ class ModelQ:
         then moves them into 'ml_tasks' for immediate processing.
         """
         while True:
-            now = time.time()
-            ready_tasks = self.redis_client.zrangebyscore("delayed_tasks", 0, now)
-            for task_json in ready_tasks:
-                self.redis_client.zrem("delayed_tasks", task_json)
-                self.redis_client.lpush("ml_tasks", task_json)
-                try:
-                    _td = json.loads(task_json)
-                    self.redis_client.zadd("queued_requests", {_td["task_id"]: _td.get("queued_at", now)})
-                except Exception:
-                    pass
+            with self._guarded_iteration("requeue_delayed_tasks"):
+                now = time.time()
+                ready_tasks = self.redis_client.zrangebyscore("delayed_tasks", 0, now)
+                for task_json in ready_tasks:
+                    self.redis_client.zrem("delayed_tasks", task_json)
+                    self.redis_client.lpush("ml_tasks", task_json)
+                    try:
+                        _td = json.loads(task_json)
+                        self.redis_client.zadd("queued_requests", {_td["task_id"]: _td.get("queued_at", now)})
+                    except Exception:
+                        pass
             time.sleep(1)
 
     def requeue_inprogress_tasks(self):
@@ -712,7 +760,14 @@ class ModelQ:
                         continue
 
                     self.update_server_status(f"worker_{worker_id}: idle")
-                    task_data = self.redis_client.blpop("ml_tasks")  # blocks until a task is available
+                    # Bounded block. An unbounded BLPOP is a pure read-wait: the
+                    # worker transmits nothing, so a silently dropped connection
+                    # is never retransmitted, never times out, and never raises
+                    # — the thread parks forever on a socket Redis has already
+                    # forgotten, while the queue behind it grows unattended.
+                    # Timing out and looping forces the read to complete, which
+                    # is what lets keepalive/health-check reap the dead socket.
+                    task_data = self.redis_client.blpop("ml_tasks", timeout=self.BLPOP_TIMEOUT)
                     if not task_data:
                         continue
 
@@ -822,12 +877,34 @@ class ModelQ:
             f"Registered tasks: {task_names}"
         )
 
+    @contextlib.contextmanager
+    def _guarded_iteration(self, loop_name: str):
+        """Swallow and log any exception raised by one background-loop iteration.
+
+        A bare `while True:` in a thread is one unhandled exception away from
+        being gone for good — Python unwinds the thread and the process carries
+        on looking healthy, so no orchestrator ever restarts it. On 2026-08-15 a
+        transient Redis timeout took out the pruning thread on every replica of
+        several endpoints this way. Loops must survive a blip; only the process
+        exiting should end them.
+        """
+        try:
+            yield
+        except Exception as exc:  # noqa: BLE001 - a loop must outlive any body error
+            logger.error(
+                f"Background loop '{loop_name}' iteration failed "
+                f"({exc.__class__.__name__}: {exc}). Continuing.",
+                exc_info=True,
+            )
+            time.sleep(self.BACKGROUND_LOOP_BACKOFF)
+
     def _heartbeat_loop(self):
         """
         Continuously updates the heartbeat for this server.
         """
         while True:
-            self.heartbeat()
+            with self._guarded_iteration("heartbeat"):
+                self.heartbeat()
             time.sleep(self.HEARTBEAT_INTERVAL)
 
     def _pruning_loop(self):
@@ -835,9 +912,10 @@ class ModelQ:
         Continuously prunes servers that have not updated their heartbeat in a while.
         """
         while True:
-            self.prune_inactive_servers(timeout_seconds=self.PRUNE_TIMEOUT)
-            self.requeue_stuck_processing_tasks(threshold=180)
-            self.prune_old_task_results(older_than_seconds=self.TASK_RESULT_RETENTION)
+            with self._guarded_iteration("pruning"):
+                self.prune_inactive_servers(timeout_seconds=self.PRUNE_TIMEOUT)
+                self.requeue_stuck_processing_tasks(threshold=180)
+                self.prune_old_task_results(older_than_seconds=self.TASK_RESULT_RETENTION)
             time.sleep(self.PRUNE_CHECK_INTERVAL)
 
     def check_middleware(self, middleware_event: str,task: Optional[Task] = None, error: Optional[Exception] = None):
