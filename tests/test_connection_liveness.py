@@ -32,33 +32,34 @@ def modelq_instance():
 # 1. the queue read must be bounded
 # ---------------------------------------------------------------------------
 
-def test_worker_blpop_passes_a_timeout(modelq_instance):
-    """The worker must never issue an unbounded BLPOP.
+def test_worker_queue_read_passes_a_timeout(modelq_instance):
+    """The worker must never issue an unbounded blocking read.
 
-    This is the actual outage. `blpop(key)` with no timeout blocks forever on a
-    socket Redis has already forgotten.
+    This is the actual outage. A blocking pop with no timeout waits forever on
+    a socket Redis has already forgotten. The command is now BLMOVE rather than
+    BLPOP (see the in-flight custody work), but the property under test is the
+    same one: the read is bounded.
     """
     seen = {}
     stop = threading.Event()
 
-    def fake_blpop(key, *args, **kwargs):
-        seen["args"] = args
-        seen["kwargs"] = kwargs
+    def fake_blmove(src, dst, timeout, *args, **kwargs):
+        seen["timeout"] = timeout
         stop.set()
-        # Behave like a real timed-out BLPOP so the worker loops rather than
-        # trying to decode a task.
+        # Behave like a real timed-out blocking move so the worker loops rather
+        # than trying to decode a task.
         time.sleep(0.01)
         return None
 
     modelq_instance.redis_client = MagicMock(wraps=modelq_instance.redis_client)
-    modelq_instance.redis_client.blpop.side_effect = fake_blpop
+    modelq_instance.redis_client.blmove.side_effect = fake_blmove
 
     modelq_instance.start_workers(no_of_workers=1)
-    assert stop.wait(timeout=5), "worker never called blpop"
+    assert stop.wait(timeout=5), "worker never issued a blocking queue read"
 
-    timeout = seen["kwargs"].get("timeout", seen["args"][0] if seen["args"] else None)
-    assert timeout is not None, "BLPOP was issued without a timeout"
-    assert timeout > 0, f"BLPOP timeout must be positive, got {timeout!r}"
+    timeout = seen["timeout"]
+    assert timeout is not None, "blocking read was issued without a timeout"
+    assert timeout > 0, f"timeout must be positive, got {timeout!r}"
 
 
 def test_blpop_timeout_stays_below_socket_timeout():
