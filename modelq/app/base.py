@@ -153,6 +153,7 @@ class ModelQ:
         webhook_url: Optional[str] = None,  # Optional webhook for error logging
         requeue_threshold : Optional[int] = None ,
         delay_seconds: int = 30,
+        retry_task_max_attempts: int = 3,  # Cap on RetryTaskException re-queues
         task_history_retention: Optional[int] = None,  # Configurable history retention (default 24h)
         task_ttl: Optional[int] = None,  # Configurable task TTL (default 24h)
         inactive_if_worker_boot_fail: bool = False,  # Mark worker as unhealthy if before_worker_boot fails
@@ -194,6 +195,7 @@ class ModelQ:
         self.webhook_url = webhook_url
         self.requeue_threshold = requeue_threshold
         self.delay_seconds = delay_seconds
+        self.retry_task_max_attempts = retry_task_max_attempts
         self.task_history_retention = task_history_retention or self.TASK_HISTORY_RETENTION
         self.task_ttl = task_ttl or self.TASK_TTL
         self.inactive_if_worker_boot_fail = inactive_if_worker_boot_fail
@@ -1035,10 +1037,41 @@ class ModelQ:
             logger.info(f"Task {task.task_name} completed successfully.")
 
         except RetryTaskException as e:
-            logger.warning(f"Task {task.task_name} requested retry: {e}")
-            new_task_dict = task.to_dict()
-            new_task_dict["payload"] = task.original_payload
-            self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
+            # A RetryTaskException used to re-queue unconditionally, with no
+            # attempt counter. Any task whose failure is permanent -- an image
+            # URL that has expired or been deleted, for example -- therefore
+            # looped forever, re-entering the queue every delay_seconds and
+            # burning worker capacity that never produced a result.
+            # Bound it. The counter travels on the payload so it survives the
+            # round trip through Redis, and uses a reserved key so it cannot
+            # collide with the caller's own "retries" budget used elsewhere.
+            payload = task.original_payload if isinstance(task.original_payload, dict) else {}
+            attempts = int(payload.get("_retry_attempts", 0) or 0) + 1
+            max_attempts = max(0, int(getattr(self, "retry_task_max_attempts", 3)))
+
+            if attempts > max_attempts:
+                task.status = "failed"
+                task.result = (
+                    f"Retry limit reached after {max_attempts} attempt(s): {e}"
+                )
+                self._store_final_task_state(task, success=False, error=e)
+                self.log_task_error_to_file(task, e)
+                self.check_middleware("on_error", task=task, error=e)
+                self.post_error_to_webhook(task, e)
+                logger.error(
+                    f"Task {task.task_name} exhausted its retry budget "
+                    f"({max_attempts}); marking failed: {e}"
+                )
+            else:
+                logger.warning(
+                    f"Task {task.task_name} requested retry "
+                    f"({attempts}/{max_attempts}): {e}"
+                )
+                new_task_dict = task.to_dict()
+                new_task_dict["payload"] = task.original_payload
+                if isinstance(new_task_dict.get("payload"), dict):
+                    new_task_dict["payload"]["_retry_attempts"] = attempts
+                self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
         except Exception as e:
             # Mark as failed
             task.status = "failed"
