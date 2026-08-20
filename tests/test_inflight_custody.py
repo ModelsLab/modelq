@@ -60,6 +60,36 @@ def test_drain_returns_held_tasks_to_the_queue(mq):
     assert mq.redis_client.smembers(mq.INFLIGHT_REGISTRY) == set()
 
 
+def test_drain_clears_stale_processing_marker_before_task_is_visible(mq):
+    """A mid-task crash must not trip the next worker's duplicate guard."""
+    inflight = mq._inflight_key(0)
+    mq.redis_client.rpush(inflight, _task("crashed"))
+    mq.redis_client.sadd(mq.INFLIGHT_REGISTRY, inflight)
+    mq.redis_client.sadd("processing_tasks", "crashed")
+
+    assert mq.drain_inflight(inflight) == 1
+
+    recovered = json.loads(mq.redis_client.lindex("ml_tasks", 0))
+    assert recovered["task_id"] == "crashed"
+    assert recovered["status"] == "queued"
+    assert not mq.redis_client.sismember("processing_tasks", "crashed")
+    assert mq.redis_client.zscore("queued_requests", "crashed") is not None
+    assert mq.redis_client.ttl("task:crashed") > 0
+
+    # This is the exact guard that previously discarded the recovered copy.
+    assert mq.redis_client.sadd("processing_tasks", "crashed") == 1
+
+
+def test_drain_keeps_malformed_entries_recoverable(mq):
+    """Bad payloads still move atomically instead of blocking the whole list."""
+    inflight = mq._inflight_key(0)
+    mq.redis_client.rpush(inflight, "not-json")
+    mq.redis_client.sadd(mq.INFLIGHT_REGISTRY, inflight)
+
+    assert mq.drain_inflight(inflight) == 1
+    assert mq.redis_client.lpop("ml_tasks") == b"not-json"
+
+
 def test_drain_is_bounded_and_terminates_on_empty(mq):
     """An unbounded drain loop spins forever the day the list refills."""
     assert mq.drain_inflight(mq._inflight_key(9)) == 0

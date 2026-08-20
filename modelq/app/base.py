@@ -981,19 +981,73 @@ class ModelQ:
         """Return every task held in `inflight_key` to the front of the queue.
 
         Tasks land here only when a worker took custody but never finished, so
-        they are older than anything already queued and go back to the head.
-        Uses LMOVE so a crash mid-drain cannot lose a task: it is in one list or
-        the other at every instant, never in neither.
+        they are older than anything already queued and go back to the head. A
+        recovered task may already be present in ``processing_tasks`` if its
+        worker died after pickup. The queue handoff, processing-marker cleanup,
+        task-state reset, and queue-index restore therefore happen in one Redis
+        transaction. A new worker can never observe the queued copy while the
+        stale processing marker is still present and reject the only copy as a
+        duplicate.
         """
         # Bounded by the length read up front. The owner is gone, so nothing is
         # appending; an unbounded `while True` here would spin forever the day
         # that assumption breaks.
         moved = 0
         for _ in range(self.redis_client.llen(inflight_key) or 0):
-            item = self.redis_client.lmove(inflight_key, "ml_tasks", "RIGHT", "LEFT")
+            while True:
+                pipe = self.redis_client.pipeline()
+                try:
+                    # Multiple healthy servers can discover the same abandoned
+                    # list on the same pruning pass. WATCH makes the tail read
+                    # below and the subsequent RPOP refer to the same item.
+                    pipe.watch(inflight_key)
+                    item = pipe.lindex(inflight_key, -1)
+                    if item is None:
+                        pipe.unwatch()
+                        break
+
+                    recovered_item = item
+                    task_id = None
+                    queued_at = time.time()
+                    try:
+                        task_dict = json.loads(item)
+                        task_id = task_dict.get("task_id")
+                        if task_id:
+                            # Match the established stuck-task recovery contract:
+                            # recovered work is queued again with a fresh queue
+                            # timestamp and a bounded task record.
+                            task_dict["status"] = "queued"
+                            task_dict["queued_at"] = queued_at
+                            recovered_item = json.dumps(task_dict)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Could not decode in-flight entry from '{inflight_key}' "
+                            f"during recovery: {exc}. Returning it unchanged."
+                        )
+
+                    pipe.multi()
+                    pipe.rpop(inflight_key)
+                    pipe.lpush("ml_tasks", recovered_item)
+                    if task_id:
+                        pipe.set(
+                            f"task:{task_id}",
+                            recovered_item,
+                            ex=self.task_ttl,
+                        )
+                        pipe.zadd("queued_requests", {task_id: queued_at})
+                        pipe.srem("processing_tasks", task_id)
+                    results = pipe.execute()
+                    if results[0] is not None:
+                        moved += 1
+                    break
+                except redis.WatchError:
+                    # Another recovery worker won the race. Re-read the new tail
+                    # rather than applying cleanup for the item it moved.
+                    continue
+                finally:
+                    pipe.reset()
             if item is None:
                 break
-            moved += 1
         self.redis_client.srem(self.INFLIGHT_REGISTRY, inflight_key)
         if moved:
             logger.warning(f"Recovered {moved} in-flight task(s) from '{inflight_key}'.")
