@@ -388,44 +388,104 @@ class ModelQ:
                     # Remove from processing set
                     self.redis_client.srem("processing_tasks", task_id)
 
-    def prune_old_task_results(self, older_than_seconds: int = None):
+    SCAN_BATCH = 500
+
+    def prune_old_task_results(self, older_than_seconds: int = None) -> int:
         """
-        Deletes task result keys (stored with the prefix 'task_result:') whose
-        finished_at (or started_at if finished_at is not available) timestamp is older
-        than `older_than_seconds`. In addition, it also removes the corresponding
-        task key (stored with the prefix 'task:').
+        Deletes `task_result:*` keys (and their `task:*` twin) that have lost
+        their TTL and are older than `older_than_seconds`. Returns the count.
+
+        Expiry is Redis's job. Every task_result key is written with a TTL, so a
+        key that still has one needs nothing from us -- this only has to catch
+        keys whose TTL went missing (a write path that forgot `ex=`, a
+        RENAME/RESTORE that dropped it), which would otherwise live forever.
+
+        The cost is in deciding *which* keys to read, not in the delete. TTL is
+        an 8-byte reply and is pipelined, so a healthy keyspace is walked without
+        transferring a single payload; only keys already known to be broken get
+        read. The previous version GET the JSON of every key to compare one
+        timestamp: on a production shard that was 196.7M SCAN + 228.8M GET over
+        26 days -- ~2.2 hours of blocked event loop and 13.5TB of network output
+        -- to issue 2 deletes.
+
+        Bulk-reading with MGET would make this worse, not better. task_result
+        payloads reach 7MB, so a batched read builds one huge client output
+        buffer, and that is what pushes RSS past the container limit and gets
+        redis-server OOM-killed.
         """
         if older_than_seconds is None:
             older_than_seconds = self.TASK_RESULT_RETENTION
 
         now = time.time()
-        keys_deleted = 0
+        pruned = 0
+        batch = []
 
-        # Use scan_iter to avoid blocking Redis
-        for key in self.redis_client.scan_iter("task_result:*"):
-            try:
-                task_json = self.redis_client.get(key)
-                if not task_json:
-                    continue
-                task_data = json.loads(task_json)
-                # Use finished_at if available; otherwise fallback to started_at
-                timestamp = task_data.get("finished_at") or task_data.get("started_at")
-                if timestamp and (now - timestamp > older_than_seconds):
-                    # Delete the task_result key
-                    self.redis_client.delete(key)
-                    # Extract the task id from the key and delete the corresponding task key.
-                    key_str = key.decode("utf-8") if isinstance(key, bytes) else key
-                    task_id = key_str.split("task_result:")[-1]
-                    task_key = f"task:{task_id}"
-                    self.redis_client.delete(task_key)
-                    keys_deleted += 1
-                    logger.info(f"Deleted old keys: {key_str} and {task_key}")
-            except Exception as e:
+        def flush(batch):
+            """TTL the batch; only keys missing one are worth reading."""
+            if not batch:
+                return 0
+            pipe = self.redis_client.pipeline(transaction=False)
+            for key in batch:
+                pipe.ttl(key)
+            ttls = pipe.execute()
+
+            # -1 == exists with no expiry (leaked). -2 == already gone.
+            # Anything with a TTL is Redis's problem, not ours.
+            orphans = [key for key, ttl in zip(batch, ttls) if ttl == -1]
+            if not orphans:
+                return 0
+
+            # Only now do we read values, and only for the broken keys.
+            pipe = self.redis_client.pipeline(transaction=False)
+            for key in orphans:
+                pipe.get(key)
+            blobs = pipe.execute()
+
+            expired, keep = [], []
+            for key, blob in zip(orphans, blobs):
                 key_str = key.decode("utf-8") if isinstance(key, bytes) else key
-                logger.error(f"Error processing key {key_str}: {e}")
+                try:
+                    task_data = json.loads(blob) if blob else {}
+                except Exception as e:
+                    logger.error(f"Error parsing {key_str}: {e}")
+                    keep.append(key)
+                    continue
+                stamp = task_data.get("finished_at") or task_data.get("started_at")
+                if stamp and (now - stamp > older_than_seconds):
+                    expired.append((key, key_str.split("task_result:")[-1]))
+                else:
+                    keep.append(key)
 
-        if keys_deleted:
-            logger.info(f"Pruned {keys_deleted} task(s) older than {older_than_seconds} seconds.")
+            pipe = self.redis_client.pipeline(transaction=False)
+            for key, task_id in expired:
+                # UNLINK, not DELETE: frees multi-MB payloads off the main thread.
+                pipe.unlink(key)
+                pipe.unlink(f"task:{task_id}")
+            for key in keep:
+                # Not old enough to drop, but it must not live forever.
+                pipe.expire(key, older_than_seconds)
+            pipe.execute()
+
+            for _, task_id in expired:
+                logger.info(f"Pruned untracked task_result:{task_id} and task:{task_id}")
+            for key in keep:
+                key_str = key.decode("utf-8") if isinstance(key, bytes) else key
+                logger.warning(f"task_result key had no TTL, set to {older_than_seconds}s: {key_str}")
+            return len(expired)
+
+        try:
+            for key in self.redis_client.scan_iter("task_result:*", count=self.SCAN_BATCH):
+                batch.append(key)
+                if len(batch) >= self.SCAN_BATCH:
+                    pruned += flush(batch)
+                    batch = []
+            pruned += flush(batch)
+        except Exception as e:
+            logger.error(f"Error scanning task_result keys: {e}")
+
+        if pruned:
+            logger.info(f"Pruned {pruned} task(s) older than {older_than_seconds} seconds.")
+        return pruned
             
     def update_server_status(self, status: str):
         """
@@ -917,7 +977,12 @@ class ModelQ:
             with self._guarded_iteration("pruning"):
                 self.prune_inactive_servers(timeout_seconds=self.PRUNE_TIMEOUT)
                 self.requeue_stuck_processing_tasks(threshold=180)
-                self.prune_old_task_results(older_than_seconds=self.TASK_RESULT_RETENTION)
+                # prune_old_task_results() is deliberately NOT called here. Every
+                # task_result key is written with a TTL, so Redis expires it on
+                # its own; running the scan every PRUNE_CHECK_INTERVAL only
+                # re-read the whole keyspace. Measured on a production shard over
+                # 26 days: 196.7M SCAN + 228.8M GET to issue 2 DELs. Call it
+                # manually if you ever need to repair keys that lost their TTL.
             time.sleep(self.PRUNE_CHECK_INTERVAL)
 
     def check_middleware(self, middleware_event: str,task: Optional[Task] = None, error: Optional[Exception] = None):
