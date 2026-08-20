@@ -136,6 +136,14 @@ class ModelQ:
     SOCKET_TIMEOUT = 60         # seconds: hard ceiling on any single read
     SOCKET_CONNECT_TIMEOUT = 10  # seconds: fail fast when the host is unreachable
     HEALTH_CHECK_INTERVAL = 30  # seconds: PING a pooled connection idle this long
+
+    # --- in-flight task liveness --------------------------------------------
+    # A worker republishes a heartbeat for every task it is actually running, so
+    # "still working" can be told apart from "the worker died holding this".
+    # Refreshed on the heartbeat thread's cadence; a task counts as abandoned
+    # once its heartbeat is older than INFLIGHT_STALE_AFTER.
+    INFLIGHT_HEARTBEAT_KEY = "task_heartbeats"
+    INFLIGHT_STALE_AFTER = 180  # seconds without a heartbeat before we re-queue
     BACKGROUND_LOOP_BACKOFF = 5  # seconds: pause before retrying a crashed loop body
 
     # --- in-flight task custody ------------------------------------------------
@@ -197,6 +205,10 @@ class ModelQ:
             )
 
         self.worker_threads = []
+        # task_id -> started_at for every task this process is currently running.
+        # Guarded because worker threads mutate it while the heartbeat thread reads it.
+        self._inflight_tasks = {}
+        self._inflight_lock = threading.Lock()
         if server_id is None:
             # Attempt to load the server_id from a local file:
             server_id = self._get_or_create_server_id_file()
@@ -356,48 +368,251 @@ class ModelQ:
             ex=self.TASK_HISTORY_RETENTION
         )
 
-    def requeue_stuck_processing_tasks(self, threshold: float = 180.0):
+    # ------------------------------------------------------------------ #
+    # In-flight task liveness                                            #
+    # ------------------------------------------------------------------ #
+
+    def _mark_task_inflight(self, task_id: str, started_at: float) -> None:
+        """Record that this process is actively running `task_id`."""
+        with self._inflight_lock:
+            self._inflight_tasks[task_id] = started_at
+        try:
+            self.redis_client.hset(
+                self.INFLIGHT_HEARTBEAT_KEY, task_id, str(started_at)
+            )
+        except Exception as e:  # never let bookkeeping kill a task
+            logger.warning(f"Could not publish in-flight heartbeat for {task_id}: {e}")
+
+    def _clear_task_inflight(self, task_id: str) -> None:
+        """Forget `task_id`; it is no longer running here."""
+        with self._inflight_lock:
+            self._inflight_tasks.pop(task_id, None)
+        try:
+            self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
+        except Exception as e:
+            logger.warning(f"Could not clear in-flight heartbeat for {task_id}: {e}")
+
+    def _publish_inflight_heartbeats(self) -> None:
         """
-        Re-queues any tasks that have been in 'processing' for more than 'threshold' seconds.
+        Refresh the heartbeat of every task running in this process.
+
+        Without this, `requeue_stuck_processing_tasks` can only ask "how long ago
+        did this start?", which re-queues healthy long jobs: a 500s video
+        generation crosses a 180s threshold every single time and gets run again
+        on another GPU while the first worker is still producing the same output.
+        A heartbeat separates "running long" from "nobody is holding this".
+        """
+        with self._inflight_lock:
+            snapshot = dict(self._inflight_tasks)
+
+        if not snapshot:
+            return
+
+        now = time.time()
+        try:
+            self.redis_client.hset(
+                self.INFLIGHT_HEARTBEAT_KEY,
+                mapping={task_id: str(now) for task_id in snapshot},
+            )
+        except Exception as e:
+            logger.warning(f"Could not refresh in-flight heartbeats: {e}")
+
+    def _inflight_heartbeats(self) -> dict:
+        """task_id -> last heartbeat timestamp, across every worker on this queue."""
+        try:
+            raw = self.redis_client.hgetall(self.INFLIGHT_HEARTBEAT_KEY) or {}
+        except Exception as e:
+            logger.warning(f"Could not read in-flight heartbeats: {e}")
+            return {}
+
+        beats = {}
+        for key, value in raw.items():
+            task_id = key.decode("utf-8") if isinstance(key, bytes) else key
+            try:
+                beats[task_id] = float(value)
+            except (TypeError, ValueError):
+                continue
+        return beats
+
+    @staticmethod
+    def _is_terminal_status(status: Optional[str]) -> bool:
+        return status in ("completed", "failed", "cancelled")
+
+    def _requeue_custodied_task(
+        self, task_id: str, task_dict: dict, queued_at: float
+    ) -> bool:
+        """Atomically move a stale task out of worker custody and back to queue.
+
+        Returns ``False`` for mixed-version workers that use no custody list, so
+        the caller can retain the original processing-set recovery path.
+        """
+        recovered_task = dict(task_dict)
+        recovered_task["status"] = "queued"
+        recovered_task["queued_at"] = queued_at
+        recovered_blob = json.dumps(recovered_task)
+
+        for raw_key in self.redis_client.smembers(self.INFLIGHT_REGISTRY) or []:
+            inflight_key = (
+                raw_key.decode("utf-8") if isinstance(raw_key, bytes) else raw_key
+            )
+            while True:
+                pipe = self.redis_client.pipeline()
+                try:
+                    pipe.watch(inflight_key)
+                    matching_item = None
+                    for item in pipe.lrange(inflight_key, 0, -1) or []:
+                        try:
+                            candidate = json.loads(item)
+                        except Exception:
+                            continue
+                        if candidate.get("task_id") == task_id:
+                            matching_item = item
+                            break
+
+                    if matching_item is None:
+                        pipe.unwatch()
+                        break
+
+                    # Keep the list registered: its owning worker/server may
+                    # still be alive and will reuse this custody list.
+                    pipe.multi()
+                    pipe.lrem(inflight_key, 1, matching_item)
+                    pipe.rpush("ml_tasks", recovered_blob)
+                    pipe.set(
+                        f"task:{task_id}", recovered_blob, ex=self.task_ttl
+                    )
+                    pipe.zadd("queued_requests", {task_id: queued_at})
+                    pipe.srem("processing_tasks", task_id)
+                    pipe.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
+                    results = pipe.execute()
+                    if results[0] == 1:
+                        return True
+                    break
+                except redis.WatchError:
+                    continue
+                finally:
+                    pipe.reset()
+        return False
+
+    def requeue_stuck_processing_tasks(self, threshold: float = INFLIGHT_STALE_AFTER):
+        """
+        Re-queue tasks that no worker is holding any more.
+
+        "Stuck" used to mean "started more than `threshold` seconds ago", which
+        is not the same question. A 500s video generation crosses a 180s
+        threshold while it is running perfectly well, gets pushed back onto
+        `ml_tasks`, and a second GPU renders the same output again. Liveness is
+        now decided by the heartbeat the owning worker republishes
+        (`_publish_inflight_heartbeats`), so long jobs are left alone and a task
+        whose worker actually died is picked up as soon as its heartbeat goes
+        stale -- which is sooner than the old rule managed.
+
+        Tasks that already reached a terminal state are drained rather than
+        re-queued: `process_task` removes them on the way out, but a worker
+        killed between finishing and cleaning up leaves the id behind, and those
+        strays otherwise sit in `processing_tasks` until their task key expires
+        a day later, inflating every processing count that reads the set.
         """
 
-        if self.requeue_threshold :
+        if self.requeue_threshold:
             threshold = self.requeue_threshold
 
         processing_task_ids = self.redis_client.smembers("processing_tasks")
+        if not processing_task_ids:
+            return
+
         now = time.time()
+        heartbeats = self._inflight_heartbeats()
 
         for pid in processing_task_ids:
-            task_id = pid.decode("utf-8")
+            task_id = pid.decode("utf-8") if isinstance(pid, bytes) else pid
+
+            # A fresh heartbeat means a worker is holding this right now. Skip it
+            # before fetching the task, so a busy queue does not re-read every
+            # in-flight payload once a minute just to decide to do nothing.
+            last_beat = heartbeats.get(task_id)
+            if last_beat is not None and now - last_beat <= threshold:
+                continue
+
             task_data = self.redis_client.get(f"task:{task_id}")
             if not task_data:
                 # If there's no data in Redis for that task, remove it from processing set.
                 self.redis_client.srem("processing_tasks", task_id)
+                self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
                 logger.warning(
                     f"No record found for in-progress task {task_id}. Removing from 'processing_tasks'."
                 )
                 continue
 
             task_dict = json.loads(task_data)
-            started_at = task_dict.get("started_at", 0)
-            if started_at:
-                if now - started_at > threshold:
-                    logger.info(
-                        f"Re-queuing stuck task {task_id} which has been 'processing' for {now - started_at:.2f} seconds."
-                    )
-                    # Update status, queued_at, etc.
-                    task_dict["status"] = "queued"
-                    task_dict["queued_at"] = now
-    
-                    # Store the updated dict back in Redis
-                    self.redis_client.set(f"task:{task_id}", json.dumps(task_dict),ex=86400)
-                    
-                    # Push it back into ml_tasks
-                    self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
-                    self.redis_client.zadd("queued_requests", {task_id: now})
 
-                    # Remove from processing set
-                    self.redis_client.srem("processing_tasks", task_id)
+            if self._is_terminal_status(task_dict.get("status")):
+                self.redis_client.srem("processing_tasks", task_id)
+                self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
+                logger.info(
+                    f"Draining finished task {task_id} "
+                    f"(status={task_dict.get('status')}) from 'processing_tasks'."
+                )
+                continue
+
+            started_at = task_dict.get("started_at", 0)
+            if not started_at:
+                continue
+
+            age = now - started_at
+            if last_beat is None and age <= threshold:
+                # No heartbeat at all: either a worker on an older build, or one
+                # that has not reached its first heartbeat tick yet. Fall back to
+                # the age rule so mixed-version fleets behave as they did before.
+                continue
+
+            if last_beat is not None:
+                logger.info(
+                    f"Re-queuing abandoned task {task_id}: no heartbeat for "
+                    f"{now - last_beat:.2f}s."
+                )
+            else:
+                logger.info(
+                    f"Re-queuing stuck task {task_id} which has been "
+                    f"'processing' for {age:.2f} seconds."
+                )
+
+            # New workers keep a recoverable custody copy in Redis. Move that
+            # exact copy instead of creating a second queue entry and leaving
+            # the original to be recovered again later. False means an older
+            # worker with no custody list, so the established fallback below is
+            # intentionally preserved for rolling deployments.
+            if self._requeue_custodied_task(task_id, task_dict, now):
+                continue
+
+            # Custody can disappear because the worker completed while we were
+            # deciding. Re-check the terminal state before using the legacy
+            # fallback so a just-finished task is never resurrected.
+            refreshed_data = self.redis_client.get(f"task:{task_id}")
+            if not refreshed_data:
+                self.redis_client.srem("processing_tasks", task_id)
+                self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
+                continue
+            task_dict = json.loads(refreshed_data)
+            if self._is_terminal_status(task_dict.get("status")):
+                self.redis_client.srem("processing_tasks", task_id)
+                self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
+                continue
+
+            # Update status, queued_at, etc.
+            task_dict["status"] = "queued"
+            task_dict["queued_at"] = now
+
+            # Store the updated dict back in Redis
+            self.redis_client.set(f"task:{task_id}", json.dumps(task_dict), ex=self.task_ttl)
+
+            # Push it back into ml_tasks
+            self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
+            self.redis_client.zadd("queued_requests", {task_id: now})
+
+            # Remove from processing set
+            self.redis_client.srem("processing_tasks", task_id)
+            self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
 
     SCAN_BATCH = 500
 
@@ -865,10 +1080,12 @@ class ModelQ:
                     # Release custody only when we are finished with it, whatever
                     # the outcome. If this process dies mid-task the entry stays
                     # put on purpose — that is what makes it recoverable.
+                    claimed_task_id = None
                     try:
                         self.update_server_status(f"worker_{worker_id}: busy")
                         task_dict = json.loads(task_json)
                         task = Task.from_dict(task_dict)
+                        claimed_task_id = task.task_id
 
                         # Mark task as 'processing'
                         added = self.redis_client.sadd("processing_tasks", task.task_id)
@@ -885,13 +1102,27 @@ class ModelQ:
                         # inflates queue_num / queue_time.
                         self.redis_client.zrem("queued_requests", task.task_id)
 
-                        # Set started_at
-                        task_dict["started_at"] = time.time()
+                        # Set started_at on BOTH the dict we persist and the Task
+                        # object. _store_final_task_state() serialises from the Task,
+                        # so leaving it off the object silently overwrote the real
+                        # pickup time with null on completion.
+                        started_at = time.time()
+                        task_dict["status"] = "processing"
+                        task_dict["started_at"] = started_at
+                        task.started_at = started_at
 
                         # Update in Redis
-                        self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict),ex=86400)
+                        self.redis_client.set(
+                            f"task:{task.task_id}",
+                            json.dumps(task_dict),
+                            ex=self.task_ttl,
+                        )
 
                         if task.task_name in self.allowed_tasks:
+                            # Only a worker that can actually execute this task
+                            # advertises it as live. Routing it elsewhere must not
+                            # leave a heartbeat that suppresses future recovery.
+                            self._mark_task_inflight(task.task_id, started_at)
                             try:
                                 logger.info(f"Worker {worker_id} started processing: {task.task_name}")
 
@@ -947,6 +1178,10 @@ class ModelQ:
                             self.redis_client.zadd("queued_requests", {task.task_id: task_dict.get("queued_at", time.time())})
                             self.redis_client.srem("processing_tasks", task.task_id)
                     finally:
+                        if claimed_task_id is not None:
+                            # Idempotent with process_task's cleanup and covers
+                            # routing/worker-loop errors before process_task runs.
+                            self._clear_task_inflight(claimed_task_id)
                         self.redis_client.lrem(inflight_key, 1, task_json)
 
                 except Exception as e:
@@ -1008,17 +1243,35 @@ class ModelQ:
 
                     recovered_item = item
                     task_id = None
+                    terminal = False
                     queued_at = time.time()
                     try:
                         task_dict = json.loads(item)
                         task_id = task_dict.get("task_id")
                         if task_id:
-                            # Match the established stuck-task recovery contract:
-                            # recovered work is queued again with a fresh queue
-                            # timestamp and a bounded task record.
-                            task_dict["status"] = "queued"
-                            task_dict["queued_at"] = queued_at
-                            recovered_item = json.dumps(task_dict)
+                            task_key = f"task:{task_id}"
+                            # A worker can finish and publish its terminal state,
+                            # then die before the custody-finally removes the list
+                            # entry. Watch the record with the list so recovery
+                            # never turns that completed task back into queued work.
+                            pipe.watch(task_key)
+                            current_blob = pipe.get(task_key)
+                            try:
+                                current_task = (
+                                    json.loads(current_blob) if current_blob else {}
+                                )
+                            except Exception:
+                                current_task = {}
+                            terminal = self._is_terminal_status(
+                                current_task.get("status")
+                            )
+                            if not terminal:
+                                # Match the established stuck-task recovery contract:
+                                # recovered work is queued again with a fresh queue
+                                # timestamp and a bounded task record.
+                                task_dict["status"] = "queued"
+                                task_dict["queued_at"] = queued_at
+                                recovered_item = json.dumps(task_dict)
                     except Exception as exc:
                         logger.warning(
                             f"Could not decode in-flight entry from '{inflight_key}' "
@@ -1027,18 +1280,28 @@ class ModelQ:
 
                     pipe.multi()
                     pipe.rpop(inflight_key)
-                    pipe.lpush("ml_tasks", recovered_item)
                     if task_id:
-                        pipe.set(
-                            f"task:{task_id}",
-                            recovered_item,
-                            ex=self.task_ttl,
-                        )
-                        pipe.zadd("queued_requests", {task_id: queued_at})
                         pipe.srem("processing_tasks", task_id)
+                        pipe.hdel(self.INFLIGHT_HEARTBEAT_KEY, task_id)
+                    if terminal:
+                        pipe.zrem("queued_requests", task_id)
+                    else:
+                        pipe.lpush("ml_tasks", recovered_item)
+                        if task_id:
+                            pipe.set(
+                                f"task:{task_id}",
+                                recovered_item,
+                                ex=self.task_ttl,
+                            )
+                            pipe.zadd("queued_requests", {task_id: queued_at})
                     results = pipe.execute()
-                    if results[0] is not None:
+                    if results[0] is not None and not terminal:
                         moved += 1
+                    elif results[0] is not None:
+                        logger.info(
+                            f"Discarded terminal task {task_id} from abandoned "
+                            f"in-flight list '{inflight_key}'."
+                        )
                     break
                 except redis.WatchError:
                     # Another recovery worker won the race. Re-read the new tail
@@ -1114,6 +1377,8 @@ class ModelQ:
         while True:
             with self._guarded_iteration("heartbeat"):
                 self.heartbeat()
+            with self._guarded_iteration("inflight_heartbeat"):
+                self._publish_inflight_heartbeats()
             time.sleep(self.HEARTBEAT_INTERVAL)
 
     def _pruning_loop(self):
@@ -1126,7 +1391,9 @@ class ModelQ:
                 # Runs after the prune so dead servers are already deregistered
                 # and their in-flight lists read as abandoned on this same pass.
                 self.recover_abandoned_inflight_tasks()
-                self.requeue_stuck_processing_tasks(threshold=180)
+                self.requeue_stuck_processing_tasks(
+                    threshold=self.INFLIGHT_STALE_AFTER
+                )
                 # prune_old_task_results() is deliberately NOT called here. Every
                 # task_result key is written with a TTL, so Redis expires it on
                 # its own; running the scan every PRUNE_CHECK_INTERVAL only
@@ -1338,6 +1605,7 @@ class ModelQ:
 
         finally:
             self.redis_client.srem("processing_tasks", task.task_id)
+            self._clear_task_inflight(task.task_id)
 
 
     def _store_final_task_state(self, task: Task, success: bool, error: Optional[Exception] = None):
@@ -1349,6 +1617,20 @@ class ModelQ:
 
         # Mark finished_at
         task_dict["finished_at"] = time.time()
+
+        # Stop advertising this task as in-flight before the terminal blob is
+        # visible. Ordering matters: the blob now carries a real started_at, and
+        # a sweeper that saw it while the id was still in `processing_tasks`
+        # could read "started long ago" and re-queue work that is already done.
+        try:
+            self.redis_client.srem("processing_tasks", task.task_id)
+            self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task.task_id)
+        except Exception as e:
+            logger.warning(
+                f"Could not clear in-flight state for {task.task_id}: {e}"
+            )
+        with self._inflight_lock:
+            self._inflight_tasks.pop(task.task_id, None)
 
         # Add error details if failed
         if not success and error:
