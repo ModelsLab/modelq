@@ -90,6 +90,25 @@ def test_drain_keeps_malformed_entries_recoverable(mq):
     assert mq.redis_client.lpop("ml_tasks") == b"not-json"
 
 
+def test_drain_does_not_rerun_task_that_finished_before_custody_release(mq):
+    """A crash after terminal persistence must not resurrect completed work."""
+    inflight = mq._inflight_key(0)
+    task_id = "finished-before-release"
+    mq.redis_client.rpush(inflight, _task(task_id))
+    mq.redis_client.sadd(mq.INFLIGHT_REGISTRY, inflight)
+    mq.redis_client.sadd("processing_tasks", task_id)
+    mq.redis_client.set(
+        f"task:{task_id}",
+        json.dumps({"task_id": task_id, "status": "completed", "result": "ok"}),
+    )
+
+    assert mq.drain_inflight(inflight) == 0
+    assert mq.redis_client.llen(inflight) == 0
+    assert mq.redis_client.llen("ml_tasks") == 0
+    assert not mq.redis_client.sismember("processing_tasks", task_id)
+    assert json.loads(mq.redis_client.get(f"task:{task_id}"))["status"] == "completed"
+
+
 def test_drain_is_bounded_and_terminates_on_empty(mq):
     """An unbounded drain loop spins forever the day the list refills."""
     assert mq.drain_inflight(mq._inflight_key(9)) == 0
