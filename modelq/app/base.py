@@ -138,6 +138,17 @@ class ModelQ:
     HEALTH_CHECK_INTERVAL = 30  # seconds: PING a pooled connection idle this long
     BACKGROUND_LOOP_BACKOFF = 5  # seconds: pause before retrying a crashed loop body
 
+    # --- in-flight task custody ------------------------------------------------
+    # BLPOP removes the task from the list and *then* writes it to the client. If
+    # that write is lost, the task exists nowhere: not in the queue, not in
+    # processing_tasks (which is only populated after the reply arrives), and so
+    # invisible to every recovery sweep. BLMOVE instead moves the task into a
+    # per-worker in-flight list as a single atomic step, so a task in transit to
+    # a worker that never receives it stays parked somewhere we can find it.
+    INFLIGHT_PREFIX = "inflight"
+    # Registry of every in-flight list, so recovery never has to SCAN for them.
+    INFLIGHT_REGISTRY = "inflight_lists"
+
     def __init__(
         self,
         host: str = "localhost",
@@ -795,6 +806,12 @@ class ModelQ:
         else:
             self.check_middleware("before_worker_boot")
 
+        # Anything still in OUR in-flight lists is debris from a previous run of
+        # this server_id — a live worker of ours cannot exist yet. Drain before
+        # starting workers, never after, or we would yank a task out from under
+        # a worker that had just claimed it.
+        self.recover_abandoned_inflight_tasks(include_self=True)
+
         # 1) Delayed re-queue thread
         requeue_thread = threading.Thread(target=self.requeue_delayed_tasks, daemon=True)
         requeue_thread.start()
@@ -813,6 +830,10 @@ class ModelQ:
         # 4) Worker threads
         def worker_loop(worker_id):
             self.check_middleware("after_worker_boot")
+            inflight_key = self._inflight_key(worker_id)
+            # Register before taking custody of anything, so a task can never be
+            # held in a list that recovery does not know to look in.
+            self.redis_client.sadd(self.INFLIGHT_REGISTRY, inflight_key)
             while True:
                 try:
                     # Check worker health before picking up tasks
@@ -829,91 +850,104 @@ class ModelQ:
                     # forgotten, while the queue behind it grows unattended.
                     # Timing out and looping forces the read to complete, which
                     # is what lets keepalive/health-check reap the dead socket.
-                    task_data = self.redis_client.blpop("ml_tasks", timeout=self.BLPOP_TIMEOUT)
-                    if not task_data:
+                    # Custody handoff, not a handoff-and-hope. BLPOP removes the
+                    # task and *then* writes it; if that write is lost the task is
+                    # gone from every structure that could recover it. BLMOVE makes
+                    # taking the task and recording who took it one atomic step, so
+                    # a task in transit to a worker that never receives it stays in
+                    # `inflight_key` until a sweep returns it to the queue.
+                    task_json = self.redis_client.blmove(
+                        "ml_tasks", inflight_key, self.BLPOP_TIMEOUT, "LEFT", "RIGHT"
+                    )
+                    if not task_json:
                         continue
 
-                    self.update_server_status(f"worker_{worker_id}: busy")
-                    _, task_json = task_data
-                    task_dict = json.loads(task_json)
-                    task = Task.from_dict(task_dict)
+                    # Release custody only when we are finished with it, whatever
+                    # the outcome. If this process dies mid-task the entry stays
+                    # put on purpose — that is what makes it recoverable.
+                    try:
+                        self.update_server_status(f"worker_{worker_id}: busy")
+                        task_dict = json.loads(task_json)
+                        task = Task.from_dict(task_dict)
 
-                    # Mark task as 'processing'
-                    added = self.redis_client.sadd("processing_tasks", task.task_id)
-                    if added == 0:
-                        logger.warning(
-                            f"Task {task.task_id} is already being processed. Skipping duplicate."
-                        )
-                        continue
-                    task.status = "processing"
-
-                    # The task has left the queue (claimed for processing). Keep the
-                    # `queued_requests` index in sync with `ml_tasks`; otherwise it
-                    # accumulates every completed/failed task forever and badly
-                    # inflates queue_num / queue_time.
-                    self.redis_client.zrem("queued_requests", task.task_id)
-
-                    # Set started_at
-                    task_dict["started_at"] = time.time()
-
-                    # Update in Redis
-                    self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict),ex=86400)
-
-                    if task.task_name in self.allowed_tasks:
-                        try:
-                            logger.info(f"Worker {worker_id} started processing: {task.task_name}")
-
-                            # Add Sentry breadcrumb for task processing
-                            if self.sentry_enabled:
-                                add_breadcrumb(
-                                    message=f"Processing task: {task.task_name}",
-                                    category="task",
-                                    level="info",
-                                    data={"task_id": task.task_id, "worker_id": worker_id},
-                                )
-
-                            start_time = time.time()
-                            self.process_task(task)
-                            end_time = time.time()
-                            logger.info(
-                                f"Worker {worker_id} finished {task.task_name} "
-                                f"in {end_time - start_time:.2f} seconds"
+                        # Mark task as 'processing'
+                        added = self.redis_client.sadd("processing_tasks", task.task_id)
+                        if added == 0:
+                            logger.warning(
+                                f"Task {task.task_id} is already being processed. Skipping duplicate."
                             )
+                            continue
+                        task.status = "processing"
 
-                        except TaskProcessingError as e:
-                            if self._should_ignore_sentry_exception(e.__cause__):
-                                logger.warning(
-                                    "Worker %s encountered an ignored Sentry TaskProcessingError: %s",
-                                    worker_id,
-                                    e,
+                        # The task has left the queue (claimed for processing). Keep the
+                        # `queued_requests` index in sync with `ml_tasks`; otherwise it
+                        # accumulates every completed/failed task forever and badly
+                        # inflates queue_num / queue_time.
+                        self.redis_client.zrem("queued_requests", task.task_id)
+
+                        # Set started_at
+                        task_dict["started_at"] = time.time()
+
+                        # Update in Redis
+                        self.redis_client.set(f"task:{task.task_id}", json.dumps(task_dict),ex=86400)
+
+                        if task.task_name in self.allowed_tasks:
+                            try:
+                                logger.info(f"Worker {worker_id} started processing: {task.task_name}")
+
+                                # Add Sentry breadcrumb for task processing
+                                if self.sentry_enabled:
+                                    add_breadcrumb(
+                                        message=f"Processing task: {task.task_name}",
+                                        category="task",
+                                        level="info",
+                                        data={"task_id": task.task_id, "worker_id": worker_id},
+                                    )
+
+                                start_time = time.time()
+                                self.process_task(task)
+                                end_time = time.time()
+                                logger.info(
+                                    f"Worker {worker_id} finished {task.task_name} "
+                                    f"in {end_time - start_time:.2f} seconds"
                                 )
-                            else:
+
+                            except TaskProcessingError as e:
+                                if self._should_ignore_sentry_exception(e.__cause__):
+                                    logger.warning(
+                                        "Worker %s encountered an ignored Sentry TaskProcessingError: %s",
+                                        worker_id,
+                                        e,
+                                    )
+                                else:
+                                    logger.error(
+                                        f"Worker {worker_id} encountered a TaskProcessingError: {e}"
+                                    )
+                                if task.payload.get("retries", 0) > 0:
+                                    new_task_dict = task.to_dict()
+                                    new_task_dict["payload"] = task.original_payload
+                                    new_task_dict["payload"]["retries"] -= 1
+                                    self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
+
+                            except Exception as e:
                                 logger.error(
-                                    f"Worker {worker_id} encountered a TaskProcessingError: {e}"
+                                    f"Worker {worker_id} encountered an unexpected error: {e}"
                                 )
-                            if task.payload.get("retries", 0) > 0:
-                                new_task_dict = task.to_dict()
-                                new_task_dict["payload"] = task.original_payload
-                                new_task_dict["payload"]["retries"] -= 1
-                                self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
-
-                        except Exception as e:
-                            logger.error(
-                                f"Worker {worker_id} encountered an unexpected error: {e}"
+                                if task.payload.get("retries", 0) > 0:
+                                    new_task_dict = task.to_dict()
+                                    new_task_dict["payload"] = task.original_payload
+                                    new_task_dict["payload"]["retries"] -= 1
+                                    self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
+                        else:
+                            # If task is not allowed on this server, re-queue it
+                            logger.warning(
+                                f"Worker {worker_id} cannot process task {task.task_name}, re-queueing..."
                             )
-                            if task.payload.get("retries", 0) > 0:
-                                new_task_dict = task.to_dict()
-                                new_task_dict["payload"] = task.original_payload
-                                new_task_dict["payload"]["retries"] -= 1
-                                self.enqueue_delayed_task(new_task_dict, delay_seconds=self.delay_seconds)
-                    else:
-                        # If task is not allowed on this server, re-queue it
-                        logger.warning(
-                            f"Worker {worker_id} cannot process task {task.task_name}, re-queueing..."
-                        )
-                        self.redis_client.rpush("ml_tasks", task_json)
-                        self.redis_client.zadd("queued_requests", {task.task_id: task_dict.get("queued_at", time.time())})
-                        self.redis_client.srem("processing_tasks", task.task_id)
+                            self.redis_client.rpush("ml_tasks", task_json)
+                            self.redis_client.zadd("queued_requests", {task.task_id: task_dict.get("queued_at", time.time())})
+                            self.redis_client.srem("processing_tasks", task.task_id)
+                    finally:
+                        self.redis_client.lrem(inflight_key, 1, task_json)
 
                 except Exception as e:
                     logger.error(
@@ -938,6 +972,119 @@ class ModelQ:
             f"{self.redis_client.connection_pool.connection_kwargs['port']}. "
             f"Registered tasks: {task_names}"
         )
+
+    def _inflight_key(self, worker_id: int) -> str:
+        """Per-worker custody list. Scoped by server so recovery can attribute it."""
+        return f"{self.INFLIGHT_PREFIX}:{self.server_id}:{worker_id}"
+
+    def drain_inflight(self, inflight_key: str) -> int:
+        """Return every task held in `inflight_key` to the front of the queue.
+
+        Tasks land here only when a worker took custody but never finished, so
+        they are older than anything already queued and go back to the head. A
+        recovered task may already be present in ``processing_tasks`` if its
+        worker died after pickup. The queue handoff, processing-marker cleanup,
+        task-state reset, and queue-index restore therefore happen in one Redis
+        transaction. A new worker can never observe the queued copy while the
+        stale processing marker is still present and reject the only copy as a
+        duplicate.
+        """
+        # Bounded by the length read up front. The owner is gone, so nothing is
+        # appending; an unbounded `while True` here would spin forever the day
+        # that assumption breaks.
+        moved = 0
+        for _ in range(self.redis_client.llen(inflight_key) or 0):
+            while True:
+                pipe = self.redis_client.pipeline()
+                try:
+                    # Multiple healthy servers can discover the same abandoned
+                    # list on the same pruning pass. WATCH makes the tail read
+                    # below and the subsequent RPOP refer to the same item.
+                    pipe.watch(inflight_key)
+                    item = pipe.lindex(inflight_key, -1)
+                    if item is None:
+                        pipe.unwatch()
+                        break
+
+                    recovered_item = item
+                    task_id = None
+                    queued_at = time.time()
+                    try:
+                        task_dict = json.loads(item)
+                        task_id = task_dict.get("task_id")
+                        if task_id:
+                            # Match the established stuck-task recovery contract:
+                            # recovered work is queued again with a fresh queue
+                            # timestamp and a bounded task record.
+                            task_dict["status"] = "queued"
+                            task_dict["queued_at"] = queued_at
+                            recovered_item = json.dumps(task_dict)
+                    except Exception as exc:
+                        logger.warning(
+                            f"Could not decode in-flight entry from '{inflight_key}' "
+                            f"during recovery: {exc}. Returning it unchanged."
+                        )
+
+                    pipe.multi()
+                    pipe.rpop(inflight_key)
+                    pipe.lpush("ml_tasks", recovered_item)
+                    if task_id:
+                        pipe.set(
+                            f"task:{task_id}",
+                            recovered_item,
+                            ex=self.task_ttl,
+                        )
+                        pipe.zadd("queued_requests", {task_id: queued_at})
+                        pipe.srem("processing_tasks", task_id)
+                    results = pipe.execute()
+                    if results[0] is not None:
+                        moved += 1
+                    break
+                except redis.WatchError:
+                    # Another recovery worker won the race. Re-read the new tail
+                    # rather than applying cleanup for the item it moved.
+                    continue
+                finally:
+                    pipe.reset()
+            if item is None:
+                break
+        self.redis_client.srem(self.INFLIGHT_REGISTRY, inflight_key)
+        if moved:
+            logger.warning(f"Recovered {moved} in-flight task(s) from '{inflight_key}'.")
+        return moved
+
+    def recover_abandoned_inflight_tasks(
+        self, active_server_ids=None, include_self: bool = False
+    ) -> int:
+        """Re-queue tasks stranded in the in-flight lists of dead workers.
+
+        `include_self` is the difference between the two callers, and getting it
+        wrong is the one way this can lose work. At startup our own lists are
+        debris from a previous run and must be drained. From the periodic sweep
+        they belong to our own live workers, which are mid-task — draining those
+        would hand the same task to somebody else while it is still running.
+        """
+        if active_server_ids is None:
+            active_server_ids = set(self.get_registered_server_ids() or [])
+        active_server_ids = {
+            s.decode() if isinstance(s, bytes) else s for s in active_server_ids
+        }
+
+        recovered = 0
+        for raw_key in self.redis_client.smembers(self.INFLIGHT_REGISTRY) or []:
+            key = raw_key.decode() if isinstance(raw_key, bytes) else raw_key
+            try:
+                _, owner, _ = key.split(":", 2)
+            except ValueError:
+                logger.warning(f"Ignoring malformed in-flight key '{key}'.")
+                continue
+            if owner == self.server_id:
+                if not include_self:
+                    continue
+            elif owner in active_server_ids:
+                continue  # a live worker elsewhere still owns it
+            recovered += self.drain_inflight(key)
+        return recovered
 
     @contextlib.contextmanager
     def _guarded_iteration(self, loop_name: str):
@@ -976,6 +1123,9 @@ class ModelQ:
         while True:
             with self._guarded_iteration("pruning"):
                 self.prune_inactive_servers(timeout_seconds=self.PRUNE_TIMEOUT)
+                # Runs after the prune so dead servers are already deregistered
+                # and their in-flight lists read as abandoned on this same pass.
+                self.recover_abandoned_inflight_tasks()
                 self.requeue_stuck_processing_tasks(threshold=180)
                 # prune_old_task_results() is deliberately NOT called here. Every
                 # task_result key is written with a TTL, so Redis expires it on
