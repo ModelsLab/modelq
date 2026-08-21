@@ -157,6 +157,25 @@ class ModelQ:
     # Registry of every in-flight list, so recovery never has to SCAN for them.
     INFLIGHT_REGISTRY = "inflight_lists"
 
+    # BLMOVE needs Redis >= 6.2. Plenty of deployed workers still run 6.0, where
+    # the command does not exist and every claim raises -- the worker crash-loops
+    # at ~30 restarts/second, registers nothing, and the queue silently never
+    # drains while the process still looks healthy. Fall back to an atomic Lua
+    # LPOP+RPUSH polled on a short interval: same FIFO order, same "taking the
+    # task and recording who took it is one step" guarantee, just not blocking.
+    #
+    # BRPOPLPUSH is NOT a valid substitute: it pops the tail, which turns the
+    # queue LIFO against an rpush producer.
+    _CLAIM_TASK_LUA = """
+    local task = redis.call('LPOP', KEYS[1])
+    if task then
+        redis.call('RPUSH', KEYS[2], task)
+    end
+    return task
+    """
+    # How often the fallback re-checks the queue while waiting.
+    CLAIM_POLL_INTERVAL = 0.1
+
     def __init__(
         self,
         host: str = "localhost",
@@ -209,6 +228,9 @@ class ModelQ:
         # Guarded because worker threads mutate it while the heartbeat thread reads it.
         self._inflight_tasks = {}
         self._inflight_lock = threading.Lock()
+        # Probed lazily on the first claim; see _blmove_supported().
+        self._blmove_available = None
+        self._claim_script = None
         if server_id is None:
             # Attempt to load the server_id from a local file:
             server_id = self._get_or_create_server_id_file()
@@ -371,6 +393,59 @@ class ModelQ:
     # ------------------------------------------------------------------ #
     # In-flight task liveness                                            #
     # ------------------------------------------------------------------ #
+
+    def _blmove_supported(self) -> bool:
+        """
+        Whether this Redis has BLMOVE (>= 6.2). Probed once, on a key that cannot
+        exist, and cached -- an unsupported server must not cost a round trip and
+        an exception on every single claim.
+        """
+        if self._blmove_available is None:
+            try:
+                self.redis_client.blmove(
+                    "modelq:blmove:probe", "modelq:blmove:probe", 0.01, "LEFT", "RIGHT"
+                )
+                self._blmove_available = True
+            except redis.exceptions.ResponseError as e:
+                if "unknown command" in str(e).lower():
+                    logger.warning(
+                        "Redis has no BLMOVE (needs >= 6.2); claiming tasks with the "
+                        "polled Lua fallback instead. Queue order and in-flight "
+                        "custody are unchanged."
+                    )
+                    self._blmove_available = False
+                else:
+                    # A different server-side error says nothing about support.
+                    self._blmove_available = True
+            except (AttributeError, TypeError):
+                # redis-py older than 3.5 has no blmove() binding at all.
+                self._blmove_available = False
+        return self._blmove_available
+
+    def _claim_task(self, inflight_key: str):
+        """
+        Atomically move one task from `ml_tasks` into this worker's in-flight
+        list, blocking up to BLPOP_TIMEOUT. Returns the raw task JSON, or None if
+        nothing arrived in time.
+        """
+        if self._blmove_supported():
+            return self.redis_client.blmove(
+                "ml_tasks", inflight_key, self.BLPOP_TIMEOUT, "LEFT", "RIGHT"
+            )
+
+        # Polled equivalent for Redis < 6.2. The Lua body is atomic, so the task
+        # is never in neither list; only the waiting is emulated.
+        if self._claim_script is None:
+            self._claim_script = self.redis_client.register_script(self._CLAIM_TASK_LUA)
+
+        deadline = time.time() + self.BLPOP_TIMEOUT
+        while True:
+            task_json = self._claim_script(keys=["ml_tasks", inflight_key])
+            if task_json:
+                return task_json
+            if time.time() >= deadline:
+                return None
+            time.sleep(self.CLAIM_POLL_INTERVAL)
 
     def _mark_task_inflight(self, task_id: str, started_at: float) -> None:
         """Record that this process is actively running `task_id`."""
@@ -1076,9 +1151,7 @@ class ModelQ:
                     # taking the task and recording who took it one atomic step, so
                     # a task in transit to a worker that never receives it stays in
                     # `inflight_key` until a sweep returns it to the queue.
-                    task_json = self.redis_client.blmove(
-                        "ml_tasks", inflight_key, self.BLPOP_TIMEOUT, "LEFT", "RIGHT"
-                    )
+                    task_json = self._claim_task(inflight_key)
                     if not task_json:
                         continue
 
