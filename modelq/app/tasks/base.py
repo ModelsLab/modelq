@@ -77,6 +77,41 @@ class Task:
         task.stream = data.get("stream", False)
         return task
 
+    def _absorb_timestamps(self, data: dict) -> None:
+        """
+        Copy queue/run timestamps from a task blob onto this Task, keeping whatever
+        is already set when the blob omits a field (an older worker, or a re-queue
+        that has not run yet).
+        """
+        for field in ("created_at", "queued_at", "started_at", "finished_at"):
+            value = data.get(field)
+            if value is not None:
+                setattr(self, field, value)
+
+    def stage_timings(self) -> Dict[str, float]:
+        """
+        Wall-clock split of this task's life, in seconds, for whichever stages have
+        both of their timestamps. Keys are omitted rather than zeroed when a stage
+        cannot be measured, so a caller never reports a fabricated 0.0.
+
+        - queue_time: enqueued until a worker picked it up
+        - run_time:   worker start until the result was persisted
+        - total_time: enqueued until the result was persisted
+        """
+        timings: Dict[str, float] = {}
+
+        def span(start: Optional[float], end: Optional[float], key: str) -> None:
+            if start is None or end is None:
+                return
+            delta = end - start
+            if delta >= 0:
+                timings[key] = round(delta, 3)
+
+        span(self.queued_at, self.started_at, "queue_time")
+        span(self.started_at, self.finished_at, "run_time")
+        span(self.queued_at, self.finished_at, "total_time")
+        return timings
+
     def _convert_to_string(self, data: Any) -> str:
         """
         Converts data to a string representation. If the data is a PIL image,
@@ -188,6 +223,12 @@ class Task:
                 task_data = json.loads(task_json)
                 self.result = task_data.get("result")
                 self.status = task_data.get("status")
+                # The terminal blob carries the queue/run timestamps. Copy them back
+                # onto the Task so a caller that blocked on the result can report how
+                # much of the wait was queueing and how much was the run itself,
+                # without a second Redis read. Raising here (failed/cancelled) must
+                # still leave them populated, so this runs before the status checks.
+                self._absorb_timestamps(task_data)
 
                 if self.status == "failed":
                     error_message = self.result or "Task failed without an error message"
