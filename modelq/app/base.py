@@ -986,6 +986,11 @@ class ModelQ:
                 now_ts = time.time()
                 task_dict["created_at"] = now_ts
                 task_dict["queued_at"]  = now_ts
+                # Mirror onto the Task the producer gets back, otherwise its
+                # queued_at stays None and the caller cannot tell queue wait apart
+                # from run time once the result lands.
+                task.created_at = now_ts
+                task.queued_at = now_ts
 
                 self.enqueue_task(task_dict, payload=payload)
                 self.redis_client.set(f"task:{task.task_id}",
