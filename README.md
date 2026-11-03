@@ -302,6 +302,91 @@ Attach to ModelQ instance:
 q.middleware = LoggingMiddleware()
 ```
 
+### Task preprocessors and postprocessors
+
+Preprocessors use a separate Redis queue and dedicated worker threads. They run
+while execution workers are busy with earlier tasks. Once preprocessing finishes,
+its result is stored in Redis and the task joins the execution queue. Execution
+workers read the stored result without running the preprocessor again.
+
+Start both stages with:
+
+```python
+mq.start_workers(no_of_workers=1, no_of_preprocessors=4)
+```
+
+The default is four preprocessing threads per worker process, independent of
+`no_of_workers`. Workers must be running for preprocessing to progress; when all
+preprocessing threads are occupied, further tasks wait in the preprocessing queue.
+This overlaps preprocessing with execution queue wait, without guaranteeing that
+every preprocessor starts immediately under load.
+
+Processors run outside the task body. A preprocessor receives the
+same positional and keyword arguments as the task (a validated model when using
+`schema=`). Its `start()` finishes before the task body starts, and its return
+value must be JSON-serializable and is available through
+`get_preprocessor_result()`. JSON objects, arrays, strings, numbers, booleans,
+and `None` are supported. Inputs are copied so that
+processor mutations do not change the task's arguments. Processor classes must
+have a constructor that takes no arguments; a fresh instance is created per call.
+
+```python
+from modelq import ModelQ
+from modelq.middleware import (
+    ProcessorMiddleware,
+    get_preprocessor_result,
+    send_postprocessor,
+)
+
+mq = ModelQ()
+
+class Preprocessor(ProcessorMiddleware):
+    def start(self, param):
+        return {"sum": param["a"] + param["b"]}
+
+class Postprocessor(ProcessorMiddleware):
+    async def start(self, param):
+        # For example: await save_to_storage(param)
+        print("Postprocessing:", param)
+
+@mq.task(preprocessor=Preprocessor, postprocessor=Postprocessor)
+def add(param):
+    prepared = get_preprocessor_result()
+    send_postprocessor({"sum": prepared["sum"], "source": param})
+    return prepared["sum"]
+
+task = add({"a": 2, "b": 3})
+```
+
+`Processor_middlware` and `Processor_middleware` are aliases of
+`ProcessorMiddleware`. Either processor can implement synchronous `def start`
+or asynchronous `async def start`.
+
+`send_postprocessor(*args, **kwargs)` copies and stages the supplied input. After
+the task completes successfully and its result is persisted, staged calls run
+in a shared background pool of four threads. The task and its caller do not wait
+for postprocessing. Calling this helper multiple times stages multiple calls;
+without a call, no postprocessing runs. It returns a `concurrent.futures.Future`
+for observing completion outside the task; **do not wait on it inside the task**.
+
+Failed, retried, or timed-out attempts discard their staged calls and cancel
+their futures. Preprocessing runs again on each retry, and its errors follow the
+task's normal retry handling. The configured `timeout` applies independently to
+the preprocessing stage and the non-streaming task body; queue wait is excluded.
+Streaming task bodies retain the existing behavior of not enforcing a timeout.
+Preprocessing uses recoverable in-flight custody, and ready results survive a
+worker restart. A crash before the result is stored can repeat preprocessing, so
+its side effects should be idempotent. Cancellation prevents a completed
+preprocessor from publishing its task for execution. Helpers are scoped to the current task attempt; calling them outside
+that execution raises `RuntimeError`. Without a preprocessor,
+`get_preprocessor_result()` returns `None`.
+
+Postprocessor failures are logged and exposed on the future without changing the
+successful task result. Background calls run in the worker process and are not
+persisted or automatically retried; a process crash can lose pending work.
+Postprocessors may overlap other tasks and should make side effects idempotent
+if tasks can be replayed.
+
 ---
 
 ## 🚫 Task Cancellation

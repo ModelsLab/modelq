@@ -99,6 +99,7 @@ def get_system_info() -> Dict[str, Any]:
 from modelq.app.tasks import Task
 from modelq.exceptions import TaskProcessingError, TaskTimeoutError,RetryTaskException
 from modelq.app.middleware import Middleware
+from modelq.middleware import _ProcessorExecution, _validate_processor
 from modelq.app.redis_retry import _RedisWithRetry
 from modelq.app.sentry import (
     is_sentry_available,
@@ -119,6 +120,9 @@ logger = logging.getLogger(__name__)
 
 
 class ModelQ:
+    PREPROCESSING_QUEUE = "ml_preprocessing_tasks"
+    PREPROCESSING_PENDING = "_mq_preprocessing_pending"
+    PREPROCESSOR_RESULT = "_mq_preprocessor_result"
     # Constants for heartbeat and pruning intervals
     HEARTBEAT_INTERVAL = 30     # seconds: how often this server updates its heartbeat
     PRUNE_TIMEOUT = 300         # seconds: how long before a server is considered stale
@@ -422,7 +426,7 @@ class ModelQ:
                 self._blmove_available = False
         return self._blmove_available
 
-    def _claim_task(self, inflight_key: str):
+    def _claim_task(self, inflight_key: str, queue_name: str = "ml_tasks"):
         """
         Atomically move one task from `ml_tasks` into this worker's in-flight
         list, blocking up to BLPOP_TIMEOUT. Returns the raw task JSON, or None if
@@ -430,7 +434,7 @@ class ModelQ:
         """
         if self._blmove_supported():
             return self.redis_client.blmove(
-                "ml_tasks", inflight_key, self.BLPOP_TIMEOUT, "LEFT", "RIGHT"
+                queue_name, inflight_key, self.BLPOP_TIMEOUT, "LEFT", "RIGHT"
             )
 
         # Polled equivalent for Redis < 6.2. The Lua body is atomic, so the task
@@ -440,7 +444,7 @@ class ModelQ:
 
         deadline = time.time() + self.BLPOP_TIMEOUT
         while True:
-            task_json = self._claim_script(keys=["ml_tasks", inflight_key])
+            task_json = self._claim_script(keys=[queue_name, inflight_key])
             if task_json:
                 return task_json
             if time.time() >= deadline:
@@ -552,7 +556,7 @@ class ModelQ:
                     # still be alive and will reuse this custody list.
                     pipe.multi()
                     pipe.lrem(inflight_key, 1, matching_item)
-                    pipe.rpush("ml_tasks", recovered_blob)
+                    pipe.rpush(self._queue_for_task(recovered_task), recovered_blob)
                     pipe.set(
                         f"task:{task_id}", recovered_blob, ex=self.task_ttl
                     )
@@ -630,7 +634,7 @@ class ModelQ:
                 )
                 continue
 
-            started_at = task_dict.get("started_at", 0)
+            started_at = task_dict.get("started_at") or last_beat or 0
             if not started_at:
                 continue
 
@@ -682,7 +686,7 @@ class ModelQ:
             self.redis_client.set(f"task:{task_id}", json.dumps(task_dict), ex=self.task_ttl)
 
             # Push it back into ml_tasks
-            self.redis_client.rpush("ml_tasks", json.dumps(task_dict))
+            self.redis_client.rpush(self._queue_for_task(task_dict), json.dumps(task_dict))
             self.redis_client.zadd("queued_requests", {task_id: now})
 
             # Remove from processing set
@@ -916,6 +920,11 @@ class ModelQ:
         if removed_count > 0:
             logger.info(f"[Prune] Total {removed_count} inactive servers pruned.")
 
+    def _queue_for_task(self, task_data: dict) -> str:
+        if isinstance(task_data, dict) and isinstance(task_data.get("payload"), dict) and task_data["payload"].get(self.PREPROCESSING_PENDING):
+            return self.PREPROCESSING_QUEUE
+        return "ml_tasks"
+
     def enqueue_task(self, task_data: dict, payload: dict):
         """
         Pushes a task into the 'ml_tasks' list with status=queued.
@@ -929,22 +938,33 @@ class ModelQ:
         if "queued_at" not in task_data:
             task_data["queued_at"] = time.time()
 
-        self.redis_client.rpush("ml_tasks", json.dumps(task_data))
-        self.redis_client.zadd("queued_requests", {task_data["task_id"]: task_data["queued_at"]})
-
-        # Add to task history
-        self._add_to_task_history(task_data["task_id"], task_data)
+        # Publish records and custody atomically, before either worker can claim.
+        blob = json.dumps(task_data)
+        with self.redis_client.pipeline() as pipe:
+            pipe.set(f"task:{task_data['task_id']}", blob, ex=self.task_ttl)
+            pipe.zadd("queued_requests", {task_data["task_id"]: task_data["queued_at"]})
+            pipe.zadd("task_history", {task_data["task_id"]: task_data.get("created_at", time.time())})
+            pipe.set(f"task_history:{task_data['task_id']}", blob, ex=self.task_history_retention)
+            pipe.rpush(self._queue_for_task(task_data), blob)
+            pipe.execute()
 
         self.check_middleware("after_enqueue")
 
     def delete_queue(self):
         self.redis_client.ltrim("ml_tasks", 1, 0)
+        self.redis_client.ltrim(self.PREPROCESSING_QUEUE, 1, 0)
         self.redis_client.delete("queued_requests")
 
     def enqueue_delayed_task(self, task_dict: dict, delay_seconds: int):
         """
         Enqueues a task into a Redis sorted set ('delayed_tasks') to be processed later.
         """
+        task_dict = dict(task_dict)
+        task_dict["payload"] = dict(task_dict.get("payload", {}))
+        function = getattr(self, task_dict.get("task_name", ""), None)
+        if getattr(function, "_mq_preprocessor", None) is not None:
+            task_dict["payload"][self.PREPROCESSING_PENDING] = True
+            task_dict["payload"].pop(self.PREPROCESSOR_RESULT, None)
         run_at = time.time() + delay_seconds
         task_json = json.dumps(task_dict)
         self.redis_client.zadd("delayed_tasks", {task_json: run_at})
@@ -961,7 +981,7 @@ class ModelQ:
                 ready_tasks = self.redis_client.zrangebyscore("delayed_tasks", 0, now)
                 for task_json in ready_tasks:
                     self.redis_client.zrem("delayed_tasks", task_json)
-                    self.redis_client.lpush("ml_tasks", task_json)
+                    self.redis_client.lpush(self._queue_for_task(json.loads(task_json)), task_json)
                     try:
                         _td = json.loads(task_json)
                         self.redis_client.zadd("queued_requests", {_td["task_id"]: _td.get("queued_at", now)})
@@ -996,6 +1016,7 @@ class ModelQ:
         """
         queued_tasks = []
         tasks_in_list = self.redis_client.lrange("ml_tasks", 0, -1)
+        tasks_in_list += self.redis_client.lrange(self.PREPROCESSING_QUEUE, 0, -1)
 
         for t_json in tasks_in_list:
             try:
@@ -1015,11 +1036,18 @@ class ModelQ:
         retries: int = 0,
         schema: Optional[Type[BaseModel]] = None,        # ▶ pydantic
         returns: Optional[Type[BaseModel]] = None,       # ▶ pydantic
+        preprocessor=None,
+        postprocessor=None,
     ):
+        _validate_processor(preprocessor)
+        _validate_processor(postprocessor)
+
         def decorator(func):
             # make the schema classes discoverable at run time
             func._mq_schema  = schema                    # ▶ pydantic
             func._mq_returns = returns                   # ▶ pydantic
+            func._mq_preprocessor = preprocessor
+            func._mq_postprocessor = postprocessor
 
             @functools.wraps(func)
             def wrapper(*args, **kwargs):
@@ -1052,6 +1080,8 @@ class ModelQ:
                     "stream": stream,
                     "retries": retries,
                 }
+                if preprocessor is not None:
+                    payload[self.PREPROCESSING_PENDING] = True
 
                 task = task_class(task_name=func.__name__, payload=payload, task_id=custom_task_id, additional_params=additional_params)
                 if stream:
@@ -1068,9 +1098,6 @@ class ModelQ:
                 task.queued_at = now_ts
 
                 self.enqueue_task(task_dict, payload=payload)
-                self.redis_client.set(f"task:{task.task_id}",
-                                      json.dumps(task_dict),
-                                      ex=86400)
                 return task
             setattr(self, func.__name__, func)
             self.allowed_tasks.add(func.__name__)
@@ -1078,14 +1105,17 @@ class ModelQ:
             return wrapper
         return decorator
 
-    def start_workers(self, no_of_workers: int = 1):
+    def start_workers(self, no_of_workers: int = 1, no_of_preprocessors: int = 4):
         """
-        Starts worker threads to pop tasks from 'ml_tasks' and process them.
+        Start execution workers and independent preprocessing workers.
+        Preprocessing continues while all execution workers are occupied.
         Also starts:
             - a thread for re-queuing delayed tasks
             - a heartbeat thread
             - a pruning thread
         """
+        if no_of_preprocessors < 1:
+            raise ValueError("no_of_preprocessors must be at least 1")
         # Avoid restarting if workers are already running
         if any(thread.is_alive() for thread in self.worker_threads):
             return
@@ -1123,7 +1153,7 @@ class ModelQ:
         self.worker_threads.append(pruning_thread)
 
         # 4) Worker threads
-        def worker_loop(worker_id):
+        def worker_loop(worker_id, preprocessing=False):
             self.check_middleware("after_worker_boot")
             inflight_key = self._inflight_key(worker_id)
             # Register before taking custody of anything, so a task can never be
@@ -1151,7 +1181,10 @@ class ModelQ:
                     # taking the task and recording who took it one atomic step, so
                     # a task in transit to a worker that never receives it stays in
                     # `inflight_key` until a sweep returns it to the queue.
-                    task_json = self._claim_task(inflight_key)
+                    if preprocessing:
+                        task_json = self._claim_task(inflight_key, self.PREPROCESSING_QUEUE)
+                    else:
+                        task_json = self._claim_task(inflight_key)
                     if not task_json:
                         continue
 
@@ -1172,22 +1205,24 @@ class ModelQ:
                                 f"Task {task.task_id} is already being processed. Skipping duplicate."
                             )
                             continue
-                        task.status = "processing"
+                        task.status = "preprocessing" if preprocessing else "processing"
 
                         # The task has left the queue (claimed for processing). Keep the
                         # `queued_requests` index in sync with `ml_tasks`; otherwise it
                         # accumulates every completed/failed task forever and badly
                         # inflates queue_num / queue_time.
-                        self.redis_client.zrem("queued_requests", task.task_id)
+                        if not preprocessing:
+                            self.redis_client.zrem("queued_requests", task.task_id)
 
                         # Set started_at on BOTH the dict we persist and the Task
                         # object. _store_final_task_state() serialises from the Task,
                         # so leaving it off the object silently overwrote the real
                         # pickup time with null on completion.
                         started_at = time.time()
-                        task_dict["status"] = "processing"
-                        task_dict["started_at"] = started_at
-                        task.started_at = started_at
+                        task_dict["status"] = task.status
+                        if not preprocessing:
+                            task_dict["started_at"] = started_at
+                            task.started_at = started_at
 
                         # Update in Redis
                         self.redis_client.set(
@@ -1214,7 +1249,13 @@ class ModelQ:
                                     )
 
                                 start_time = time.time()
-                                self.process_task(task)
+                                if preprocessing:
+                                    self.process_preprocessor(task, inflight_key, task_json)
+                                    # Handoff cleaned this stage's heartbeat before
+                                    # the execution worker could claim the task.
+                                    claimed_task_id = None
+                                else:
+                                    self.process_task(task)
                                 end_time = time.time()
                                 logger.info(
                                     f"Worker {worker_id} finished {task.task_name} "
@@ -1252,7 +1293,7 @@ class ModelQ:
                             logger.warning(
                                 f"Worker {worker_id} cannot process task {task.task_name}, re-queueing..."
                             )
-                            self.redis_client.rpush("ml_tasks", task_json)
+                            self.redis_client.rpush(self._queue_for_task(task_dict), task_json)
                             self.redis_client.zadd("queued_requests", {task.task_id: task_dict.get("queued_at", time.time())})
                             self.redis_client.srem("processing_tasks", task.task_id)
                     finally:
@@ -1272,6 +1313,17 @@ class ModelQ:
                     if self.sentry_enabled:
                         flush_sentry(timeout=2.0)
                     self.check_middleware("after_worker_shutdown")
+
+        has_preprocessors = any(
+            getattr(getattr(self, name, None), "_mq_preprocessor", None) is not None
+            for name in self.allowed_tasks
+        )
+        for i in range(no_of_preprocessors if has_preprocessors else 0):
+            worker_thread = threading.Thread(
+                target=worker_loop, args=(f"preprocessor_{i}", True), daemon=True
+            )
+            worker_thread.start()
+            self.worker_threads.append(worker_thread)
 
         for i in range(no_of_workers):
             worker_thread = threading.Thread(target=worker_loop, args=(i,), daemon=True)
@@ -1323,6 +1375,7 @@ class ModelQ:
                     task_id = None
                     terminal = False
                     queued_at = time.time()
+                    task_dict = {}
                     try:
                         task_dict = json.loads(item)
                         task_id = task_dict.get("task_id")
@@ -1364,7 +1417,7 @@ class ModelQ:
                     if terminal:
                         pipe.zrem("queued_requests", task_id)
                     else:
-                        pipe.lpush("ml_tasks", recovered_item)
+                        pipe.lpush(self._queue_for_task(task_dict), recovered_item)
                         if task_id:
                             pipe.set(
                                 f"task:{task_id}",
@@ -1487,12 +1540,114 @@ class ModelQ:
         if self.middleware:
             self.middleware.execute(event=middleware_event,task=task, error=error)
 
+    def process_preprocessor(self, task: Task, inflight_key=None, claimed_blob=None) -> None:
+        """Prepare queued work independently of execution workers.
+
+        Results travel in the task's JSON payload so another process can execute
+        the task without repeating preprocessing. A watched transaction hands
+        custody from the preprocessing worker to the execution queue.
+        """
+        execution = None
+        try:
+            if self.is_task_cancelled(task.task_id):
+                task.status = "cancelled"
+                self._store_final_task_state(task, success=False)
+                return
+            function = getattr(self, task.task_name, None)
+            if function is None or task.task_name not in self.allowed_tasks:
+                raise ValueError("Task function not available for preprocessing")
+            schema = getattr(function, "_mq_schema", None)
+            data = task.payload["data"]
+            if schema is not None:
+                args, kwargs = (schema(**(json.loads(data) if isinstance(data, str) else data)),), {}
+            else:
+                args, kwargs = tuple(data.get("args", ())), dict(data.get("kwargs", {}))
+            execution = _ProcessorExecution(getattr(function, "_mq_preprocessor", None), None)
+            timeout = task.payload.get("timeout")
+            prepare = lambda *args, **kwargs: execution.preprocessor_result
+            if timeout:
+                result = self._run_with_timeout(execution.run, timeout, prepare, *args, **kwargs)
+            else:
+                result = execution.run(prepare, *args, **kwargs)
+            # Reject non-JSON results here, before the task body can execute.
+            result = json.loads(json.dumps(result, allow_nan=False))
+            task.payload[self.PREPROCESSOR_RESULT] = result
+            task.payload.pop(self.PREPROCESSING_PENDING, None)
+            task.status = "queued"
+            task.started_at = None
+            task.finished_at = None
+            blob = json.dumps(task.to_dict())
+            task_key = f"task:{task.task_id}"
+            cancelled_key = f"task:{task.task_id}:cancelled"
+            while True:
+                with self.redis_client.pipeline() as pipe:
+                    try:
+                        pipe.watch(task_key, cancelled_key)
+                        if inflight_key is not None:
+                            pipe.watch(inflight_key)
+                            if claimed_blob not in pipe.lrange(inflight_key, 0, -1):
+                                return  # Recovery has already taken custody.
+                        current = pipe.get(task_key)
+                        status = json.loads(current).get("status") if current else None
+                        if pipe.get(cancelled_key) or self._is_terminal_status(status):
+                            pipe.unwatch()
+                            if self.is_task_cancelled(task.task_id):
+                                task.status = "cancelled"
+                                self._store_final_task_state(task, success=False)
+                            else:
+                                self._clear_task_inflight(task.task_id)
+                                self.redis_client.srem("processing_tasks", task.task_id)
+                            self.redis_client.zrem("queued_requests", task.task_id)
+                            return
+                        # Drop our local heartbeat before making the next stage
+                        # visible. The transaction clears its Redis counterpart.
+                        with self._inflight_lock:
+                            self._inflight_tasks.pop(task.task_id, None)
+                        pipe.multi()
+                        if inflight_key is not None:
+                            pipe.lrem(inflight_key, 1, claimed_blob)
+                        pipe.srem("processing_tasks", task.task_id)
+                        pipe.hdel(self.INFLIGHT_HEARTBEAT_KEY, task.task_id)
+                        pipe.set(task_key, blob, ex=self.task_ttl)
+                        pipe.set(f"task_history:{task.task_id}", blob, ex=self.task_history_retention)
+                        pipe.rpush("ml_tasks", blob)
+                        pipe.execute()
+                        return
+                    except redis.WatchError:
+                        continue
+        except RetryTaskException as exc:
+            payload = task.original_payload
+            attempts = int(payload.get("_retry_attempts", 0) or 0) + 1
+            if attempts > self.retry_task_max_attempts:
+                task.status = "failed"
+                task.result = f"Retry limit reached after {self.retry_task_max_attempts} attempt(s): {exc}"
+                self._store_final_task_state(task, success=False, error=exc)
+            else:
+                payload["_retry_attempts"] = attempts
+                retry = task.to_dict()
+                retry["payload"] = payload
+                self.enqueue_delayed_task(retry, self.delay_seconds)
+            self._clear_task_inflight(task.task_id)
+            self.redis_client.srem("processing_tasks", task.task_id)
+        except Exception as exc:
+            task.status = "failed"
+            task.result = str(exc)
+            self._store_final_task_state(task, success=False, error=exc)
+            self.log_task_error_to_file(task, exc)
+            self.check_middleware("on_error", task=task, error=exc)
+            self.post_error_to_webhook(task, exc)
+            raise TaskProcessingError(task.task_name, str(exc)) from exc
+        finally:
+            if execution is not None:
+                execution.finish()
+
     def process_task(self, task: Task) -> None:
         """
         Processes the task by invoking the registered function. Handles timeouts, streaming,
         error logging, and error reporting to a webhook.
         We'll set finished_at on success or fail.
         """
+        processor_execution = None
         try:
             if task.task_name not in self.allowed_tasks:
                 task.status = "failed"
@@ -1538,6 +1693,12 @@ class ModelQ:
                 call_kwargs = dict(task.payload['data'].get("kwargs", {}))
             timeout = task.payload.get("timeout", None)
             stream = task.payload.get("stream", False)
+            processor_execution = _ProcessorExecution(
+                getattr(task_function, "_mq_preprocessor", None),
+                getattr(task_function, "_mq_postprocessor", None),
+                prepared=self.PREPROCESSOR_RESULT in task.payload,
+                result=task.payload.get(self.PREPROCESSOR_RESULT),
+            )
 
             logger.info(
                 f"Processing task: {task.task_name} "
@@ -1546,7 +1707,7 @@ class ModelQ:
 
             if stream:
                 # Stream results
-                for result in task_function(*call_args, **call_kwargs):
+                for result in processor_execution.iterate(task_function, *call_args, **call_kwargs):
                     import json
                     task.status = "in_progress"
                     self.redis_client.xadd(
@@ -1561,12 +1722,12 @@ class ModelQ:
                 # Standard execution with optional timeout
                 if timeout:
                     result = self._run_with_timeout(
-                        task_function, timeout,
-                        *call_args, **call_kwargs
+                        processor_execution.run, timeout,
+                        task_function, *call_args, **call_kwargs
                     )
                 else:
-                    result = task_function(
-                        *call_args, **call_kwargs
+                    result = processor_execution.run(
+                        task_function, *call_args, **call_kwargs
                     )
 
                 # ---- New: Output validation for standard result
@@ -1594,6 +1755,7 @@ class ModelQ:
                 task.status = "completed"
                 self._store_final_task_state(task, success=True)
 
+            processor_execution.finish(success=True)
             logger.info(f"Task {task.task_name} completed successfully.")
 
         except RetryTaskException as e:
@@ -1682,6 +1844,8 @@ class ModelQ:
             raise TaskProcessingError(task.task_name, str(e)) from e
 
         finally:
+            if processor_execution is not None:
+                processor_execution.finish()
             self.redis_client.srem("processing_tasks", task.task_id)
             self._clear_task_inflight(task.task_id)
 
@@ -1702,6 +1866,7 @@ class ModelQ:
         # could read "started long ago" and re-queue work that is already done.
         try:
             self.redis_client.srem("processing_tasks", task.task_id)
+            self.redis_client.zrem("queued_requests", task.task_id)
             self.redis_client.hdel(self.INFLIGHT_HEARTBEAT_KEY, task.task_id)
         except Exception as e:
             logger.warning(
@@ -1830,12 +1995,13 @@ class ModelQ:
         Returns True if the task was found and removed, False otherwise.
         """
         tasks = self.redis_client.lrange("ml_tasks", 0, -1)
+        tasks += self.redis_client.lrange(self.PREPROCESSING_QUEUE, 0, -1)
         removed = False
         for task_json in tasks:
             try:
                 task_dict = json.loads(task_json)
                 if task_dict.get("task_id") == task_id:
-                    self.redis_client.lrem("ml_tasks", 1, task_json)
+                    self.redis_client.lrem(self._queue_for_task(task_dict), 1, task_json)
                     self.redis_client.zrem("queued_requests", task_id)
                     removed = True
                     logger.info(f"Removed task {task_id} from queue.")
@@ -1885,7 +2051,7 @@ class ModelQ:
                 continue
 
             status = task_dict.get("status")
-            if status == "processing":
+            if status in ("processing", "preprocessing"):
                 results.append(task_dict)
             else:
                 # If status drifted away from 'processing', tidy up the set
@@ -2160,12 +2326,13 @@ class ModelQ:
 
         # Check queued tasks
         tasks_in_queue = self.redis_client.lrange("ml_tasks", 0, -1)
+        tasks_in_queue += self.redis_client.lrange(self.PREPROCESSING_QUEUE, 0, -1)
         for task_json in tasks_in_queue:
             try:
                 task_dict = json.loads(task_json)
                 created_at = task_dict.get("created_at", 0)
                 if created_at and created_at < cutoff:
-                    self.redis_client.lrem("ml_tasks", 1, task_json)
+                    self.redis_client.lrem(self._queue_for_task(task_dict), 1, task_json)
                     task_id = task_dict.get("task_id")
                     if task_id:
                         task_dict["status"] = "expired"
