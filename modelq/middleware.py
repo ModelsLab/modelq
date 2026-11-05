@@ -35,6 +35,11 @@ def _context():
     return context
 
 
+def get_task_id():
+    """Internal queue identity, available during preparation and execution."""
+    return _context().task_id
+
+
 def get_preprocessor_result():
     """Return this task attempt's preprocessor result (None if not configured)."""
     return _context().preprocessor_result
@@ -66,7 +71,8 @@ def _start(processor, args, kwargs):
 class _ProcessorExecution:
     """One attempt's state, shared with its timeout thread but no other task."""
 
-    def __init__(self, preprocessor, postprocessor, prepared=False, result=None):
+    def __init__(self, preprocessor, postprocessor, prepared=False, result=None, task_id=None):
+        self.task_id = task_id
         self.preprocessor = preprocessor
         self.postprocessor = postprocessor
         self.preprocessor_result = result
@@ -140,5 +146,5 @@ class _ProcessorExecution:
 
 __all__ = [
     "Middleware", "ProcessorMiddleware", "Processor_middlware",
-    "Processor_middleware", "get_preprocessor_result", "send_postprocessor",
+    "Processor_middleware", "get_preprocessor_result", "get_task_id", "send_postprocessor",
 ]

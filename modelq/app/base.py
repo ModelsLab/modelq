@@ -1105,7 +1105,32 @@ class ModelQ:
             return wrapper
         return decorator
 
-    def start_workers(self, no_of_workers: int = 1, no_of_preprocessors: int = 4):
+    def _claim_bounded_preprocessor(self, inflight_key, capacity):
+        """Reserve capacity and claim atomically, using existing custody lists.
+
+        Counts ready execution tasks plus preprocessing claims. No separate
+        semaphore survives cancellation or needs repair after process death.
+        This is intended for a dedicated pipeline queue.
+        """
+        script = """
+        local used = redis.call('LLEN', KEYS[3])
+        for _, key in ipairs(redis.call('SMEMBERS', KEYS[4])) do
+            if string.match(key, ':preprocessor_[^:]+$') then
+                used = used + redis.call('LLEN', key)
+            end
+        end
+        if used >= tonumber(ARGV[1]) then return nil end
+        local blob = redis.call('LPOP', KEYS[1])
+        if blob then redis.call('RPUSH', KEYS[2], blob) end
+        return blob
+        """
+        return self.redis_client.eval(
+            script, 4, self.PREPROCESSING_QUEUE, inflight_key,
+            "ml_tasks", self.INFLIGHT_REGISTRY, capacity,
+        )
+
+    def start_workers(self, no_of_workers: int = 1, no_of_preprocessors: int = 4,
+                      max_prepared_tasks: Optional[int] = None):
         """
         Start execution workers and independent preprocessing workers.
         Preprocessing continues while all execution workers are occupied.
@@ -1114,6 +1139,8 @@ class ModelQ:
             - a heartbeat thread
             - a pruning thread
         """
+        if max_prepared_tasks is not None and max_prepared_tasks < 1:
+            raise ValueError("max_prepared_tasks must be at least 1")
         if no_of_preprocessors < 1:
             raise ValueError("no_of_preprocessors must be at least 1")
         # Avoid restarting if workers are already running
@@ -1182,7 +1209,12 @@ class ModelQ:
                     # a task in transit to a worker that never receives it stays in
                     # `inflight_key` until a sweep returns it to the queue.
                     if preprocessing:
-                        task_json = self._claim_task(inflight_key, self.PREPROCESSING_QUEUE)
+                        if max_prepared_tasks is None:
+                            task_json = self._claim_task(inflight_key, self.PREPROCESSING_QUEUE)
+                        else:
+                            task_json = self._claim_bounded_preprocessor(inflight_key, max_prepared_tasks)
+                            if not task_json:
+                                time.sleep(self.CLAIM_POLL_INTERVAL)
                     else:
                         task_json = self._claim_task(inflight_key)
                     if not task_json:
@@ -1562,7 +1594,7 @@ class ModelQ:
                 args, kwargs = (schema(**(json.loads(data) if isinstance(data, str) else data)),), {}
             else:
                 args, kwargs = tuple(data.get("args", ())), dict(data.get("kwargs", {}))
-            execution = _ProcessorExecution(getattr(function, "_mq_preprocessor", None), None)
+            execution = _ProcessorExecution(getattr(function, "_mq_preprocessor", None), None, task_id=task.task_id)
             timeout = task.payload.get("timeout")
             prepare = lambda *args, **kwargs: execution.preprocessor_result
             if timeout:
@@ -1696,6 +1728,7 @@ class ModelQ:
             processor_execution = _ProcessorExecution(
                 getattr(task_function, "_mq_preprocessor", None),
                 getattr(task_function, "_mq_postprocessor", None),
+                task_id=task.task_id,
                 prepared=self.PREPROCESSOR_RESULT in task.payload,
                 result=task.payload.get(self.PREPROCESSOR_RESULT),
             )

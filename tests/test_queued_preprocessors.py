@@ -3,6 +3,7 @@
 import json
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import fakeredis
@@ -263,3 +264,41 @@ def test_none_preprocessor_result_is_ready_and_not_run_twice(mq):
     mq.process_task(ready)
     assert ready.result == 1
     assert called.call_count == 1
+
+
+@pytest.mark.parametrize("capacity", [1, 2, 5])
+def test_capacity_edges_with_eleven_concurrent_claims(mq, capacity):
+
+    class Pre(ProcessorMiddleware):
+        def start(self, value):
+            return value
+    @mq.task(preprocessor=Pre)
+    def task(value):
+        return value
+    tasks = [task(i) for i in range(12)]
+    keys = [mq._inflight_key(f"preprocessor_{i}") for i in range(11)]
+    mq.redis_client.sadd(mq.INFLIGHT_REGISTRY, *keys)
+    barrier = threading.Barrier(len(keys))
+    def claim(key):
+        barrier.wait(timeout=10)
+        return mq._claim_bounded_preprocessor(key, capacity)
+    with ThreadPoolExecutor(len(keys)) as pool:
+        blobs = list(pool.map(claim, keys))
+    assert sum(bool(blob) for blob in blobs) == capacity
+    assert mq.redis_client.llen(mq.PREPROCESSING_QUEUE) == len(tasks) - capacity
+    for key, blob in zip(keys, blobs):
+        if blob:
+            mq.process_preprocessor(Task.from_dict(json.loads(blob)), key, blob)
+    assert mq.redis_client.llen("ml_tasks") == capacity
+    assert mq._claim_bounded_preprocessor(keys[0], capacity) is None
+    # Cancellation frees one ready place without dropping other pending jobs.
+    ready = json.loads(mq.redis_client.lindex("ml_tasks", 0))
+    mq.cancel_task(ready["task_id"])
+    assert mq._claim_bounded_preprocessor(keys[0], capacity) is not None
+
+
+@pytest.mark.parametrize("capacity", [0, -1])
+def test_invalid_capacity_fails_at_startup(mq, capacity):
+    with pytest.raises(ValueError, match="max_prepared_tasks must be at least 1"):
+        mq.start_workers(max_prepared_tasks=capacity)
+    assert not mq.worker_threads
