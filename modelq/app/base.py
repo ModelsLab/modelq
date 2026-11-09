@@ -212,6 +212,7 @@ class ModelQ:
         **kwargs,
     ):
         if redis_client:
+            self._apply_liveness_defaults(redis_client)
             self.redis_client = _RedisWithRetry(redis_client)
 
         else:
@@ -313,6 +314,42 @@ class ModelQ:
             and bool(self.sentry_ignore_exceptions)
             and isinstance(exc, self.sentry_ignore_exceptions)
         )
+
+    def _apply_liveness_defaults(self, client: Any) -> None:
+        """Give a caller-built client the half-open protection of our own pool.
+
+        Servers build `Redis(host=..., port=..., password=...)` and pass it in,
+        which skips `_connect_to_redis()`. With no socket timeout a worker parked
+        in a blocking pop on a silently dropped connection waits forever: nothing
+        is raised, so `_RedisWithRetry` never runs, and only a restart gets it
+        back. TTS and SFX ran this way through the 2026-10 outages.
+
+        Only fills what the caller left unset, and leaves anything that is not a
+        plain TCP pool alone (a unix socket connection refuses keepalive options).
+        """
+        pool = getattr(client, "connection_pool", None)
+        connection_kwargs = getattr(pool, "connection_kwargs", None)
+        connection_class = getattr(pool, "connection_class", None)
+        if not isinstance(connection_kwargs, dict) or not (
+            isinstance(connection_class, type)
+            and issubclass(connection_class, redis.connection.Connection)
+        ):
+            return
+
+        defaults = {
+            "socket_timeout": self.SOCKET_TIMEOUT,
+            "socket_connect_timeout": self.SOCKET_CONNECT_TIMEOUT,
+            "health_check_interval": self.HEALTH_CHECK_INTERVAL,
+            "socket_keepalive_options": _tcp_keepalive_options(),
+        }
+        for name, value in defaults.items():
+            if not connection_kwargs.get(name):
+                connection_kwargs[name] = value
+        connection_kwargs["socket_keepalive"] = True
+
+        # A connection the caller already opened keeps the settings it was built
+        # with, so drop those and let the pool build new ones.
+        pool.reset()
 
     def _connect_to_redis(
         self,
