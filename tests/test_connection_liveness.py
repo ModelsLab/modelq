@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 import fakeredis
 import pytest
+import redis
 
 from modelq import ModelQ
 from modelq.app.base import _tcp_keepalive_options
@@ -86,6 +87,68 @@ def test_connection_pool_enables_half_open_detection():
     assert kwargs["socket_timeout"] == ModelQ.SOCKET_TIMEOUT
     assert kwargs["socket_connect_timeout"] == ModelQ.SOCKET_CONNECT_TIMEOUT
     assert kwargs["retry_on_timeout"] is True
+
+
+def _caller_built_modelq(client):
+    with patch.object(ModelQ, "register_server"):
+        return ModelQ(redis_client=client)
+
+
+def test_caller_built_client_gets_half_open_detection():
+    """Servers pass their own Redis(...), which skips _connect_to_redis()."""
+    client = redis.Redis(host="redis.invalid", port=6379)
+
+    _caller_built_modelq(client)
+
+    kwargs = client.connection_pool.connection_kwargs
+    assert kwargs["socket_timeout"] == ModelQ.SOCKET_TIMEOUT
+    assert kwargs["socket_connect_timeout"] == ModelQ.SOCKET_CONNECT_TIMEOUT
+    assert kwargs["health_check_interval"] == ModelQ.HEALTH_CHECK_INTERVAL
+    assert kwargs["socket_keepalive"] is True
+
+
+def test_caller_built_client_keeps_its_own_values():
+    client = redis.Redis(host="redis.invalid", socket_timeout=120, health_check_interval=5)
+
+    _caller_built_modelq(client)
+
+    kwargs = client.connection_pool.connection_kwargs
+    assert kwargs["socket_timeout"] == 120
+    assert kwargs["health_check_interval"] == 5
+
+
+def test_unix_socket_client_is_left_alone():
+    client = redis.Redis(unix_socket_path="/tmp/modelq-test.sock")
+    before = dict(client.connection_pool.connection_kwargs)
+
+    _caller_built_modelq(client)
+
+    assert client.connection_pool.connection_kwargs == before
+
+
+def test_blocking_read_on_a_silent_socket_raises_instead_of_parking():
+    """The outage itself: the peer accepts, then never answers."""
+    silent = socket.socket()
+    silent.bind(("127.0.0.1", 0))
+    silent.listen(8)
+    client = redis.Redis(host="127.0.0.1", port=silent.getsockname()[1])
+    outcome = {}
+
+    def read():
+        try:
+            client.blpop("ml_tasks", timeout=1)
+        except redis.exceptions.TimeoutError as exc:
+            outcome["raised"] = exc
+
+    with patch.object(ModelQ, "SOCKET_TIMEOUT", 0.2):
+        _caller_built_modelq(client)
+        reader = threading.Thread(target=read, daemon=True)
+        reader.start()
+        reader.join(timeout=5)
+
+    silent.close()
+    assert not reader.is_alive(), "the read parked on a silent socket"
+    assert "raised" in outcome
 
 
 def test_keepalive_options_are_valid_for_this_platform():
