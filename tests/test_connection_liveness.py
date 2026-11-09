@@ -19,6 +19,8 @@ from unittest.mock import MagicMock, patch
 import fakeredis
 import pytest
 import redis
+import redis.backoff
+import redis.retry
 
 from modelq import ModelQ
 from modelq.app.base import _tcp_keepalive_options
@@ -137,7 +139,10 @@ def test_blocking_read_on_a_silent_socket_raises_instead_of_parking():
     silent = socket.socket()
     silent.bind(("127.0.0.1", 0))
     silent.listen(8)
-    client = redis.Redis(host="127.0.0.1", port=silent.getsockname()[1], **_UNSET)
+    # No client-side retries: redis-py 8 retries a timed-out read 10 times with
+    # backoff (~28 s), which would outlast the join without proving anything.
+    no_retry = redis.retry.Retry(redis.backoff.NoBackoff(), 0)
+    client = redis.Redis(host="127.0.0.1", port=silent.getsockname()[1], retry=no_retry, **_UNSET)
     outcome = {}
 
     def read():
