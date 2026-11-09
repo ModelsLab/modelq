@@ -89,6 +89,12 @@ def test_connection_pool_enables_half_open_detection():
     assert kwargs["retry_on_timeout"] is True
 
 
+# redis-py < 7 (what the GPU servers run) leaves these unset; 8.x defaults
+# them to 5 s. Spell the old defaults out so the tests mean the same thing on
+# whichever redis-py CI installs.
+_UNSET = dict(socket_timeout=None, socket_connect_timeout=None, socket_keepalive=None, health_check_interval=0)
+
+
 def _caller_built_modelq(client):
     with patch.object(ModelQ, "register_server"):
         return ModelQ(redis_client=client)
@@ -96,7 +102,7 @@ def _caller_built_modelq(client):
 
 def test_caller_built_client_gets_half_open_detection():
     """Servers pass their own Redis(...), which skips _connect_to_redis()."""
-    client = redis.Redis(host="redis.invalid", port=6379)
+    client = redis.Redis(host="redis.invalid", port=6379, **_UNSET)
 
     _caller_built_modelq(client)
 
@@ -131,7 +137,7 @@ def test_blocking_read_on_a_silent_socket_raises_instead_of_parking():
     silent = socket.socket()
     silent.bind(("127.0.0.1", 0))
     silent.listen(8)
-    client = redis.Redis(host="127.0.0.1", port=silent.getsockname()[1])
+    client = redis.Redis(host="127.0.0.1", port=silent.getsockname()[1], **_UNSET)
     outcome = {}
 
     def read():
